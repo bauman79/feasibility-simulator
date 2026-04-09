@@ -116,7 +116,13 @@ const pct= (v,t)=>t>0?(v/t*100):0;
 
 let _uid=0; const uid=()=>++_uid;
 const mkFloor  = lbl=>({ id:uid(), label:lbl, excl:"" });
-const mkRevItem= lbl=>({ id:uid(), label:lbl, exclArea:"", rentUnit:"", depositUnit:"" });
+// saleMode: "rent" | "sale" | "mixed"
+// saleRatio: % of gross area to sell (for mixed)
+// salePriceUnit: 분양단가 원/㎡ (층합계 기준)
+// saleRate: 분양률 %
+// grossAreaOverride: 직접입력 시 사용 (비어있으면 지상 총합계 면적 비율 자동계산)
+const mkRevItem= lbl=>({ id:uid(), label:lbl, exclArea:"", rentUnit:"", depositUnit:"",
+  saleMode:"rent", saleRatio:"100", salePriceUnit:"", saleRate:"100", grossAreaOverride:"" });
 const DEFAULT_REV_ITEMS={
   office:[mkRevItem("업무시설")],
   retail:[mkRevItem("상업시설"),mkRevItem("근린생활시설")],
@@ -288,35 +294,107 @@ function calcCost(bldg, area, refs){
 
 function calcRev(bldg,area,cost){
   const r=bldg.rev;
-  let annual=0,deposit=0;
-  const itemCalcs=bldg.revItems.map(item=>{ const ea=n(item.exclArea); const mon=ea*n(item.rentUnit); const ann=mon*12; const dep=ea*n(item.depositUnit); annual+=ann; deposit+=dep; return{...item,ea,mon,ann,dep}; });
+  // 지상 전용면적 합계 (비율 배분 기준)
+  const totalExcl=area.sa.ex||1;
+  // 지상 층합계(총면적) — 분양면적 배분 기준
+  const totalGfaA=area.gfaA||1;
+
+  let annual=0, deposit=0;
+  let saleIncome=0, totalSaleArea=0, totalRentExcl=0;
+
+  const itemCalcs=bldg.revItems.map(item=>{
+    const exclArea=n(item.exclArea);
+    const mode=item.saleMode||"rent";
+    const saleRatio=mode==="rent"?0:mode==="sale"?1:n(item.saleRatio)/100;
+    const rentRatio=1-saleRatio;
+
+    // 분양면적 (층합계 기준) — 직접입력 우선, 없으면 전용면적 비율로 배분
+    const grossAuto=totalExcl>0?(exclArea/totalExcl)*totalGfaA:0;
+    const grossArea=n(item.grossAreaOverride)||grossAuto;
+    const itemSaleArea=grossArea*saleRatio;
+    const itemRentExcl=exclArea*rentRatio;
+
+    // 분양수입
+    const itemSaleIncome=itemSaleArea*n(item.salePriceUnit)*(n(item.saleRate)/100);
+    // 임대수입 (임대 비율 전용면적만)
+    const mon=itemRentExcl*n(item.rentUnit);
+    const ann=mon*12;
+    const dep=itemRentExcl*n(item.depositUnit);
+
+    annual+=ann; deposit+=dep;
+    saleIncome+=itemSaleIncome; totalSaleArea+=itemSaleArea; totalRentExcl+=itemRentExcl;
+
+    return{...item, exclArea, mode, saleRatio, rentRatio,
+           grossArea, grossAuto, itemSaleArea, itemRentExcl,
+           itemSaleIncome, mon, ann, dep };
+  });
+
   const depInc=deposit*n(r.convR)/100;
   const gi=annual+depInc;
   const vacancy=gi*n(r.vacancyR)/100;
   const egi=gi-vacancy;
   const opex=egi*n(r.opexR)/100;
-  const propTaxBldg=r.propTaxBldgOverride?n(r.propTaxBldgOverride):cost.constr*0.5*PROP_TAX.bldgEffR/100;
-  const propTaxLand=r.propTaxLandOverride?n(r.propTaxLandOverride):cost.land*PROP_TAX.landEffR/100;
+  // 재산세: 임대 보유 비율만 적용
+  const rentAreaRatio=totalGfaA>0?(totalGfaA-totalSaleArea)/totalGfaA:1;
+  const propTaxBldg=r.propTaxBldgOverride?n(r.propTaxBldgOverride):cost.constr*rentAreaRatio*0.5*PROP_TAX.bldgEffR/100;
+  const propTaxLand=r.propTaxLandOverride?n(r.propTaxLandOverride):cost.land*rentAreaRatio*PROP_TAX.landEffR/100;
   const propTax=propTaxBldg+propTaxLand;
   const noi=egi-opex-propTax;
-  return{ annual,deposit,depInc,gi,vacancy,egi,opex,propTaxBldg,propTaxLand,propTax,noi,itemCalcs };
+
+  // 사업비 배분 (면적 비율)
+  const saleAreaRatio=totalGfaA>0?totalSaleArea/totalGfaA:0;
+  const saleTDC=cost.tdc*saleAreaRatio;
+  const rentTDC=cost.tdc*(1-saleAreaRatio);
+  const saleLoan=cost.loan*saleAreaRatio;
+  const rentLoan=cost.loan*(1-saleAreaRatio);
+  // 분양 개발이익
+  const saleProfit=saleIncome-saleTDC;
+  const saleProfitRate=saleTDC>0?saleProfit/saleTDC*100:0;
+  const saleSujiRate=saleTDC>0?saleIncome/saleTDC*100:0; // 사업수지율
+
+  return{ annual, deposit, depInc, gi, vacancy, egi, opex,
+          propTaxBldg, propTaxLand, propTax, noi, itemCalcs,
+          saleIncome, totalSaleArea, totalRentExcl,
+          saleAreaRatio, saleTDC, rentTDC, saleLoan, rentLoan,
+          saleProfit, saleProfitRate, saleSujiRate };
 }
 
-function calcAnalysis(tdc,equity,loan,noi,annual,anlys){
+function calcAnalysis(tdc,equity,loan,noi,annual,anlys,rev){
   const dr=n(anlys.discountR)/100;
   const exitCap=n(anlys.exitCapR)/100;
   const mortR=n(anlys.mortgageR)/100;
   const years=Math.max(1,Math.round(n(anlys.holdYears)));
   const escR=n(anlys.rentEscR)/100;
   const escPer=Math.max(1,Math.round(n(anlys.rentEscPeriod)));
-  const debtSvc=loan*mortR;
+
+  // 분양 파트
+  const saleIncome=rev?.saleIncome||0;
+  const saleProfit=rev?.saleProfit||0;
+  const saleTDC=rev?.saleTDC||0;
+  const rentLoan=rev?.rentLoan||loan; // 임대 보유분 장기 대출
+  const rentEquity=equity-saleIncome+saleTDC; // 순임대 자기자본 (분양수입으로 회수 후)
+
+  // 임대 파트 연도별 NOI
+  const debtSvc=rentLoan*mortR;
   const tv=exitCap>0?noi/exitCap:0;
-  const exitNet=tv-loan;
+  const exitNet=tv-rentLoan;
   const yearNOIs=Array.from({length:years},(_,i)=>noi*(1+escR)**Math.floor(i/escPer));
-  const cfs=[-equity,...yearNOIs.map((yn,i)=>(yn-debtSvc)+(i===years-1?exitNet:0))];
+
+  // ── 통합 현금흐름 (분양 일시수령 포함) ──
+  // year0: -equity(전체 투입) + saleIncome(분양 일시수령)
+  const yr0=(-equity)+saleIncome;
+  const cfs=[yr0,...yearNOIs.map((yn,i)=>(yn-debtSvc)+(i===years-1?exitNet:0))];
   const NPV=calcNPV(cfs,dr);
   const IRR=calcIRR(cfs);
+
+  // ── 임대 전용 분석 (분양 없는 경우와 동일한 방식) ──
+  const rentEquityForIRR=Math.max(equity-saleIncome,1); // 분양수입 공제 후 실질 투자금
+  const rentCfs=[-rentEquityForIRR,...yearNOIs.map((yn,i)=>(yn-debtSvc)+(i===years-1?exitNet:0))];
+  const rentNPV=calcNPV(rentCfs,dr);
+  const rentIRR=calcIRR(rentCfs);
+
   const capRate=tdc>0?noi/tdc*100:0;
+  const rentCapRate=(tdc-saleTDC)>0?noi/(tdc-saleTDC)*100:0;
   const coc=equity>0?(yearNOIs[0]-debtSvc)/equity*100:0;
   const grossY=tdc>0?annual/tdc*100:0;
   let payback=null,cum=cfs[0];
@@ -325,166 +403,16 @@ function calcAnalysis(tdc,equity,loan,noi,annual,anlys){
   let tb=0; for(let y=1;y<=bcYrs;y++) tb+=yearNOIs[Math.min(y-1,years-1)]/(1+dr)**y;
   tb+=exitCap>0?tv/(1+dr)**bcYrs:0;
   const bc=equity>0?tb/equity:0;
-  const sens=[-20,-10,0,10,20].map(dp=>{ const nAdj=noi*(1+dp/100); const cfAdj=nAdj-debtSvc; const tvAdj=exitCap>0?nAdj/exitCap:0; const cfsA=[-equity,...Array.from({length:years},(_,i)=>cfAdj+(i===years-1?tvAdj-loan:0))]; return{dp,noi:nAdj,cf:cfAdj,npv:calcNPV(cfsA,dr),irr:calcIRR(cfsA)}; });
-  return{ NPV,IRR:IRR!==null?IRR*100:null,capRate,coc,grossY,payback,bc,tv,cfs,yearNOIs,sens,dr,years,debtSvc };
-}
-
-// ───────────────────────────────────────────────────────
-// § 4-B. 감가상각 + 법인세/소득세 계산
-// ───────────────────────────────────────────────────────
-// 법인세 누진세율 (2024 기준): 2억이하9% / 200억이하19% / 3000억이하21% / 초과24%
-const CORP_TAX_BRACKETS=[{upTo:2e8,r:0.09},{upTo:200e8,r:0.19},{upTo:3000e8,r:0.21},{upTo:Infinity,r:0.24}];
-// 개인 종합소득세 (2024): 1400만이하6% / 5000만이하15% / 8800만이하24% / 1.5억이하35% / 3억이하38% / 5억이하40% / 10억이하42% / 초과45%
-const INDIV_TAX_BRACKETS=[{upTo:1400e4,r:0.06},{upTo:5000e4,r:0.15},{upTo:8800e4,r:0.24},{upTo:15000e4,r:0.35},{upTo:30000e4,r:0.38},{upTo:50000e4,r:0.40},{upTo:100000e4,r:0.42},{upTo:Infinity,r:0.45}];
-
-function calcProgressiveTax(taxable, brackets){
-  if(taxable<=0) return 0;
-  let tax=0, prev=0;
-  for(const b of brackets){
-    if(taxable<=prev) break;
-    const slice=Math.min(taxable,b.upTo)-prev;
-    tax+=slice*b.r;
-    prev=b.upTo;
-    if(taxable<=b.upTo) break;
-  }
-  return tax;
-}
-
-function calcTax(noi, debtSvc, constr, entityType, year){
-  // 감가상각: 건물분(공사비) ÷ 40년 정액법
-  const depre = constr / 40;
-  // 이자비용 (debtSvc에서 원금상환분 제외. 단순화: bullet 기준 전액 이자 처리, annuity는 별도 계산에서 처리)
-  // → 여기서는 세전이익 = NOI - 감가상각 (이자는 calcDebtSchedule에서 분리)
-  const ebt = noi - depre; // 세전이익 (이자는 별도 반영)
-  const brackets = entityType==="corp" ? CORP_TAX_BRACKETS : INDIV_TAX_BRACKETS;
-  const tax = calcProgressiveTax(Math.max(0, ebt), brackets);
-  const netIncome = ebt - tax;
-  return { depre, ebt, tax, netIncome, taxRate: ebt>0 ? tax/ebt*100 : 0 };
-}
-
-// ───────────────────────────────────────────────────────
-// § 4-C. 대출 상환 스케줄
-// ───────────────────────────────────────────────────────
-function calcDebtSchedule(loan, annualRate, years, repayType){
-  const r = annualRate; // 연이율
-  const schedule = [];
-  let balance = loan;
-
-  for(let y=1; y<=years; y++){
-    const interest = balance * r;
-    let principal = 0;
-    let payment = 0;
-
-    if(repayType==="bullet"){
-      // 만기일시상환: 매년 이자만, 마지막 해 원금 상환
-      principal = y===years ? balance : 0;
-      payment = interest + principal;
-    } else if(repayType==="annuity"){
-      // 원리금균등상환
-      if(r===0){ payment=loan/years; principal=payment; }
-      else { payment = loan * r * (1+r)**years / ((1+r)**years - 1); principal = payment - interest; }
-    } else {
-      // 원금균등상환
-      principal = loan / years;
-      payment = interest + principal;
-    }
-    principal = Math.min(principal, balance);
-    balance = Math.max(0, balance - principal);
-    schedule.push({ year:y, interest, principal, payment, balance });
-  }
-  return schedule;
-}
-
-// ───────────────────────────────────────────────────────
-// § 4-D. 출구 시나리오별 세후 IRR / MOIC
-// ───────────────────────────────────────────────────────
-function calcScenario(tdc, equity, loan, noi, constr, anlys){
-  const years    = Math.max(1, Math.round(n(anlys.holdYears)));
-  const escR     = n(anlys.rentEscR)/100;
-  const escPer   = Math.max(1, Math.round(n(anlys.rentEscPeriod)));
-  const exitCap  = n(anlys.exitCapR)/100;
-  const mortR    = n(anlys.mortgageR)/100;
-  const dr       = n(anlys.discountR)/100;
-  const repay    = anlys.repayType||"bullet";
-  const entity   = anlys.entityType||"corp";
-  const saleYr   = anlys.saleYear ? Math.max(1,Math.round(n(anlys.saleYear))) : years;
-
-  const schedule = calcDebtSchedule(loan, mortR, years, repay);
-  const yearNOIs = Array.from({length:years},(_,i)=>noi*(1+escR)**Math.floor(i/escPer));
-
-  // 연도별 P&L 및 세후 CF
-  const annualRows = yearNOIs.map((yn, i)=>{
-    const yr = i+1;
-    const ds = schedule[i]||{interest:0,principal:0,payment:0,balance:loan};
-    // 세금: NOI - 감가상각 - 이자 = 과세소득
-    const depre  = constr/40;
-    const taxable = Math.max(0, yn - depre - ds.interest);
-    const brackets = entity==="corp" ? CORP_TAX_BRACKETS : INDIV_TAX_BRACKETS;
-    const tax    = calcProgressiveTax(taxable, brackets);
-    const netIncome = taxable - tax;
-    const afterTaxCF = yn - ds.payment - tax; // 세후 현금흐름
-    const dscr   = ds.payment>0 ? yn/ds.payment : null;
-    return { yr, noi:yn, interest:ds.interest, principal:ds.principal, payment:ds.payment,
-             balance:ds.balance, depre, taxable, tax, netIncome, afterTaxCF, dscr };
+  const sens=[-20,-10,0,10,20].map(dp=>{
+    const nAdj=noi*(1+dp/100); const cfAdj=nAdj-debtSvc;
+    const tvAdj=exitCap>0?nAdj/exitCap:0;
+    const cfsA=[yr0,...Array.from({length:years},(_,i)=>cfAdj+(i===years-1?tvAdj-rentLoan:0))];
+    return{dp,noi:nAdj,cf:cfAdj,npv:calcNPV(cfsA,dr),irr:calcIRR(cfsA)};
   });
-
-  // ── 시나리오 A: 매각 ──
-  const buildSaleCFs = (saleY)=>{
-    const tv = exitCap>0 ? (yearNOIs[Math.min(saleY-1,years-1)]/exitCap) : 0;
-    const debtAtSale = schedule[saleY-1]?.balance ?? 0;
-    const exitNet = tv - debtAtSale;
-    const cfs = [-equity];
-    for(let y=1;y<=saleY;y++){
-      const r=annualRows[y-1];
-      const lastYearExit = y===saleY ? exitNet : 0;
-      cfs.push(r.afterTaxCF + lastYearExit);
-    }
-    return cfs;
-  };
-  const saleCFs = buildSaleCFs(saleYr);
-  const saleIRR = calcIRR(saleCFs);
-  const saleMOIC = equity>0 ? saleCFs.reduce((s,c)=>s+c,0)/equity + 1 : null;
-
-  // ── 시나리오 B: 장기 보유 ──
-  // holdYears 동안 매각 없이 보유 후 마지막 해 Cap Rate 출구
-  const holdCFs = buildSaleCFs(years);
-  const holdIRR = calcIRR(holdCFs);
-  const holdMOIC = equity>0 ? holdCFs.reduce((s,c)=>s+c,0)/equity + 1 : null;
-
-  // ── 시나리오 C: 리파이낸싱 ──
-  const refiLtv = n(anlys.refiLtvR)/100;
-  const refiR   = n(anlys.refiR)/100;
-  const refiLoan  = (exitCap>0 ? noi/exitCap : 0) * refiLtv;  // 리파이낸싱 시점 감정가 기준
-  const refiCashback = Math.max(0, refiLoan - loan); // 기존 대출 상환 후 잉여
-  // 리파이낸싱 후 계속 보유: 새 대출 이자 부담 반영
-  const refiSchedule = calcDebtSchedule(refiLoan, refiR, years, repay);
-  const refiRows = yearNOIs.map((yn,i)=>{
-    const ds = i===0 ? {interest:refiLoan*refiR,principal:0,payment:refiLoan*refiR,balance:refiLoan} : (refiSchedule[i]||{interest:0,principal:0,payment:0,balance:0});
-    const depre = constr/40;
-    const taxable = Math.max(0, yn - depre - ds.interest);
-    const tax = calcProgressiveTax(taxable, entity==="corp"?CORP_TAX_BRACKETS:INDIV_TAX_BRACKETS);
-    return yn - ds.payment - tax;
-  });
-  const refiCFs = [-equity + refiCashback, ...refiRows.map((cf,i)=>(cf+(i===years-1?(exitCap>0?yearNOIs[years-1]/exitCap*refiLtv:0)*-1+exitCap>0?yearNOIs[years-1]/exitCap*(1-refiLtv):0:0)))];
-  // 단순화: 리파이낸싱 CFs = 초기 cashback 포함, 마지막 자산가치-잔여대출
-  const refiCFsSimple = [-equity + refiCashback, ...refiRows];
-  refiCFsSimple[refiCFsSimple.length-1] += exitCap>0?(yearNOIs[years-1]/exitCap - refiLoan):0;
-  const refiIRR = calcIRR(refiCFsSimple);
-  const refiMOIC = equity>0 ? refiCFsSimple.reduce((s,c)=>s+c,0)/equity + 1 : null;
-
-  // ── 자금집행 타임라인 ──
-  const fundPre  = n(anlys.fundPreR)/100;
-  const fundFrame= n(anlys.fundFrameR)/100;
-  const fundComp = n(anlys.fundCompR)/100;
-  const fundStab = n(anlys.fundStabR)/100;
-  const fundStages=[
-    {label:"착공 전",color:C?.amber||"#92400e",eqR:fundPre,loanR:fundPre},
-    {label:"골조공사",color:"#6d28d9",eqR:fundFrame,loanR:fundFrame},
-    {label:"준공",color:"#047857",eqR:fundComp,loanR:fundComp},
-    {label:"임대안정화",color:"#1d4ed8",eqR:fundStab,loanR:fundStab},
-  ];
-
-  return { annualRows, saleCFs, saleIRR, saleMOIC, holdIRR, holdMOIC, refiIRR, refiMOIC, refiCashback, fundStages, schedule };
+  return{ NPV,IRR:IRR!==null?IRR*100:null,
+          rentNPV,rentIRR:rentIRR!==null?rentIRR*100:null,
+          capRate,rentCapRate,coc,grossY,payback,bc,tv,cfs,yearNOIs,sens,dr,years,debtSvc,
+          saleIncome,saleProfit,saleTDC,rentLoan };
 }
 
 // ═══════════════════════════════════════════════════════
@@ -503,19 +431,7 @@ const initState={
   site:{ area:"", zoneType:"일반상업" },
   buildings:[mkBldg(1,"건물 1","office")],
   activeBldgId:1, activeTab:"area", analysisScope:"all",
-  anlys:{
-    holdYears:"10", discountR:"8.0", exitCapR:"5.0", mortgageR:"5.0", bcYears:"20", rentEscR:"3.0", rentEscPeriod:"2",
-    // 회계사 기능 추가 필드
-    repayType:"bullet",      // bullet=만기일시 / annuity=원리금균등 / principal=원금균등
-    entityType:"corp",       // corp=법인 / indiv=개인
-    // 자금집행 비율 (합계 100%)
-    fundPreR:"30", fundFrameR:"30", fundCompR:"25", fundStabR:"15",
-    // 리파이낸싱 (출구 시나리오 선택 시)
-    refiLtvR:"50", refiR:"4.5",
-    // 출구 시나리오 선택
-    exitSale:true, exitHold:true, exitRefi:false,
-    saleYear:"",   // 빈값=holdYears와 동일
-  },
+  anlys:{ holdYears:"10", discountR:"8.0", exitCapR:"5.0", mortgageR:"5.0", bcYears:"20", rentEscR:"3.0", rentEscPeriod:"2" },
 };
 
 function reducer(state,{type,p}){
@@ -540,7 +456,6 @@ function reducer(state,{type,p}){
     case"TAB":   return{...state,activeTab:p};
     case"SCOPE": return{...state,analysisScope:p};
     case"ANLYS": return{...state,anlys:{...state.anlys,[p.k]:p.v}};
-    case"ANLYS_TOGGLE": return{...state,anlys:{...state.anlys,[p.k]:!state.anlys[p.k]}};
     // refs 업데이트
     case"ZONE_STD":    return{...state,refs:{...state.refs,zones:{...state.refs.zones,[p.zone]:{...state.refs.zones[p.zone],[p.k]:p.v}}}};
     case"PARK_STD":    return{...state,refs:{...state.refs,parking:{...state.refs.parking,[p.type]:{...state.refs.parking[p.type],[p.k]:p.v}}}};
@@ -1118,56 +1033,167 @@ function CostTab({bldg,dispatch,area,refs}){
 }
 
 // ═══════════════════════════════════════════════════════
-// § 11. 임대수입 탭
+// § 11. 수익 계획 탭 (임대 + 분양)
 // ═══════════════════════════════════════════════════════
+const MODE_CFG={
+  rent: { label:"임대",  color:C.accent,  bg:C.accentBg,  icon:"🏠" },
+  sale: { label:"분양",  color:"#dc2626",  bg:"#fee2e2",   icon:"💰" },
+  mixed:{ label:"혼합",  color:C.teal,    bg:C.tealBg,    icon:"🔀" },
+};
+
 function RevTab({bldg,dispatch,area,cost}){
   const bt=BT[bldg.type]||BT.office;
   const D=(type,p)=>dispatch({type,p});
   const r=bldg.rev;
   const rv=calcRev(bldg,area,cost);
-
-  if(bldg.type==="resi") return(
-    <div style={{background:C.card,border:`1.5px solid ${C.border}`,borderRadius:"12px",padding:"40px 20px",textAlign:"center",boxShadow:C.shadow}}>
-      <div style={{fontSize:"40px",marginBottom:"12px"}}>🏠</div>
-      <div style={{fontSize:"15px",fontWeight:700,color:C.text,marginBottom:"8px"}}>공동주택 분양 수익 모듈</div>
-      <div style={{fontSize:"12px",color:C.muted,lineHeight:1.8}}>분양가 × 세대 수 기반의 별도 수익 모델. 추후 업데이트 예정입니다.</div>
-    </div>
-  );
+  const hasSale=rv.itemCalcs.some(i=>i.mode!=="rent");
 
   return(
     <div>
-      <Card title="용도별 임대 수입" tag="REVENUE BY USE TYPE" accentBar={bt.color}>
-        <div style={{marginBottom:"9px",fontSize:"10px",color:C.muted}}>지상 전용면적 합계 참고: <strong style={{color:bt.color,fontFamily:C.mono}}>{fmt(area.sa.ex)} ㎡</strong></div>
-        <div style={{overflowX:"auto",border:`1.5px solid ${C.border}`,borderRadius:"9px"}}>
-          <table style={{width:"100%",borderCollapse:"collapse",minWidth:"560px"}}>
-            <thead>
-              <tr style={{background:C.cardAlt}}>
-                {["용도명","전용면적(㎡)","월 임대단가(원/㎡)","보증금단가(원/㎡)","월 수입","연 수입","보증금",""].map((h,i)=>(
-                  <th key={i} style={{padding:"8px 9px",textAlign:i<2?"left":"right",fontSize:"10px",color:C.muted,fontWeight:700,borderRight:i<7?`1px solid ${C.border}`:"none"}}>{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {rv.itemCalcs.map((item,idx)=>(
-                <tr key={item.id} style={{borderBottom:`1px solid ${C.faint}`,background:idx%2?C.cardAlt:"#fff"}}>
-                  <td style={{padding:"5px 8px",borderRight:`1px solid ${C.border}`}}><input value={item.label} onChange={e=>D("RI",{id:bldg.id,rid:item.id,k:"label",v:e.target.value})} style={{width:"100px",border:`1px solid ${C.border}`,borderRadius:"5px",padding:"3px 6px",fontSize:"11px",fontFamily:C.sans,outline:"none",fontWeight:600,color:bt.color}}/></td>
-                  <td style={{padding:"5px 8px",borderRight:`1px solid ${C.border}`}}><input value={item.exclArea} onChange={e=>D("RI",{id:bldg.id,rid:item.id,k:"exclArea",v:e.target.value})} placeholder="0.00" style={{width:"80px",border:`1px solid ${C.border}`,borderRadius:"5px",padding:"3px 7px",fontSize:"11px",fontFamily:C.mono,textAlign:"right",outline:"none"}}/></td>
-                  <td style={{padding:"5px 8px",borderRight:`1px solid ${C.border}`}}><input value={item.rentUnit} onChange={e=>D("RI",{id:bldg.id,rid:item.id,k:"rentUnit",v:e.target.value})} placeholder="0" style={{width:"80px",border:`1px solid ${C.border}`,borderRadius:"5px",padding:"3px 7px",fontSize:"11px",fontFamily:C.mono,textAlign:"right",outline:"none"}}/></td>
-                  <td style={{padding:"5px 8px",borderRight:`1px solid ${C.border}`}}><input value={item.depositUnit} onChange={e=>D("RI",{id:bldg.id,rid:item.id,k:"depositUnit",v:e.target.value})} placeholder="0" style={{width:"80px",border:`1px solid ${C.border}`,borderRadius:"5px",padding:"3px 7px",fontSize:"11px",fontFamily:C.mono,textAlign:"right",outline:"none"}}/></td>
-                  {[fM(item.mon),fM(item.ann),fM(item.dep)].map((v,i)=>(
-                    <td key={i} style={{padding:"5px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"11px",color:i===1?bt.color:C.mid,borderRight:i<2?`1px solid ${C.border}`:"none"}}>{v}</td>
-                  ))}
-                  <td style={{padding:"5px 7px",textAlign:"center"}}><button onClick={()=>D("DEL_RI",{id:bldg.id,rid:item.id})} style={{background:"transparent",border:"none",color:C.muted,cursor:"pointer",fontSize:"14px"}} onMouseEnter={e=>e.target.style.color=C.red} onMouseLeave={e=>e.target.style.color=C.muted}>×</button></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+      {/* 안내 배너 */}
+      <div style={{padding:"9px 13px",background:C.tealBg,border:`1px solid ${C.teal}30`,borderRadius:"9px",marginBottom:"14px",fontSize:"10px",color:C.teal,lineHeight:1.7}}>
+        <strong>수익 계획:</strong> 용도별로 <strong>임대 / 분양 / 혼합</strong>을 선택할 수 있습니다.
+        혼합 선택 시 분양 비율(%)에 따라 층합계 면적 기준으로 분양면적이 자동 배분됩니다.
+        분양수입은 준공 시 일시 수령으로 처리합니다 (타당성 단계 단순화).
+      </div>
+
+      <Card title="용도별 수익 계획" tag="REVENUE PLAN · 임대 + 분양" accentBar={bt.color}>
+        <div style={{marginBottom:"9px",display:"flex",gap:"14px",fontSize:"10px",color:C.muted,flexWrap:"wrap"}}>
+          <span>지상 전용면적 합계: <strong style={{color:bt.color,fontFamily:C.mono}}>{fmt(area.sa.ex)} ㎡</strong></span>
+          <span>지상 층합계(분양기준): <strong style={{color:C.teal,fontFamily:C.mono}}>{fmt(area.gfaA)} ㎡</strong></span>
         </div>
-        <div style={{marginTop:"9px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+
+        {/* 용도별 행 — 모드별 다른 UI */}
+        <div style={{border:`1.5px solid ${C.border}`,borderRadius:"9px",overflow:"hidden"}}>
+          {rv.itemCalcs.map((item,idx)=>{
+            const mc=MODE_CFG[item.mode]||MODE_CFG.rent;
+            const isSale=item.mode==="sale"||item.mode==="mixed";
+            const isRent=item.mode==="rent"||item.mode==="mixed";
+            return(
+              <div key={item.id} style={{borderBottom:idx<rv.itemCalcs.length-1?`1px solid ${C.faint}`:"none",background:idx%2?C.cardAlt:"#fff"}}>
+                {/* 헤더 행: 용도명 + 모드 선택 + 전용면적 */}
+                <div style={{display:"flex",alignItems:"center",gap:"8px",padding:"8px 10px",borderBottom:`1px solid ${C.faint}`,background:mc.bg+"60",flexWrap:"wrap"}}>
+                  <input value={item.label} onChange={e=>D("RI",{id:bldg.id,rid:item.id,k:"label",v:e.target.value})}
+                    style={{border:"none",background:"transparent",outline:"none",fontSize:"12px",fontWeight:700,color:bt.color,fontFamily:C.sans,minWidth:"80px",maxWidth:"130px"}}/>
+                  {/* 모드 선택 토글 */}
+                  <div style={{display:"flex",gap:"3px",background:"#fff",border:`1px solid ${C.border}`,borderRadius:"6px",padding:"2px",flexShrink:0}}>
+                    {Object.entries(MODE_CFG).map(([m,mc2])=>(
+                      <button key={m} onClick={()=>D("RI",{id:bldg.id,rid:item.id,k:"saleMode",v:m})}
+                        style={{padding:"3px 9px",border:"none",borderRadius:"4px",cursor:"pointer",fontSize:"10px",fontWeight:600,fontFamily:C.sans,background:item.saleMode===m?mc2.color:"transparent",color:item.saleMode===m?"#fff":C.muted,transition:"all 0.15s"}}>
+                        {mc2.icon} {mc2.label}
+                      </button>
+                    ))}
+                  </div>
+                  {/* 혼합 시 분양 비율 슬라이더 */}
+                  {item.mode==="mixed"&&(
+                    <div style={{display:"flex",alignItems:"center",gap:"6px",flexShrink:0}}>
+                      <span style={{fontSize:"10px",color:C.muted}}>분양:</span>
+                      <input type="range" min="0" max="100" step="5" value={item.saleRatio}
+                        onChange={e=>D("RI",{id:bldg.id,rid:item.id,k:"saleRatio",v:e.target.value})}
+                        style={{width:"80px",accentColor:C.teal}}/>
+                      <span style={{fontFamily:C.mono,fontSize:"11px",color:C.teal,fontWeight:700,minWidth:"32px"}}>{item.saleRatio}%</span>
+                      <span style={{fontSize:"10px",color:C.muted}}>임대:{100-n(item.saleRatio)}%</span>
+                    </div>
+                  )}
+                  {/* 전용면적 */}
+                  <div style={{display:"flex",alignItems:"center",gap:"4px",marginLeft:"auto"}}>
+                    <span style={{fontSize:"10px",color:C.muted}}>전용면적:</span>
+                    <input value={item.exclArea} onChange={e=>D("RI",{id:bldg.id,rid:item.id,k:"exclArea",v:e.target.value})} placeholder="0.00"
+                      style={{width:"75px",border:`1px solid ${C.border}`,borderRadius:"5px",padding:"3px 7px",fontSize:"11px",fontFamily:C.mono,textAlign:"right",outline:"none"}}/>
+                    <span style={{fontSize:"9px",color:C.muted}}>㎡</span>
+                  </div>
+                  <button onClick={()=>D("DEL_RI",{id:bldg.id,rid:item.id})}
+                    style={{background:"transparent",border:"none",color:C.muted,cursor:"pointer",fontSize:"14px",flexShrink:0,padding:"0 4px"}}
+                    onMouseEnter={e=>e.target.style.color=C.red} onMouseLeave={e=>e.target.style.color=C.muted}>×</button>
+                </div>
+
+                {/* 입력 행 */}
+                <div style={{display:"flex",gap:"0",flexWrap:"wrap"}}>
+                  {/* 분양 입력 */}
+                  {isSale&&(
+                    <div style={{flex:"1 1 280px",padding:"8px 12px",borderRight:`1px solid ${C.faint}`,background:"#fff9f9"}}>
+                      <div style={{fontSize:"10px",color:"#dc2626",fontWeight:700,marginBottom:"7px"}}>💰 분양 계획</div>
+                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"7px"}}>
+                        <div>
+                          <div style={{fontSize:"10px",color:C.muted,marginBottom:"3px"}}>분양단가 (원/㎡) <span style={{fontSize:"9px",color:C.teal}}>층합계 기준</span></div>
+                          <input value={item.salePriceUnit} onChange={e=>D("RI",{id:bldg.id,rid:item.id,k:"salePriceUnit",v:e.target.value})} placeholder="0"
+                            style={{width:"100%",boxSizing:"border-box",border:`1px solid ${C.border}`,borderRadius:"5px",padding:"5px 8px",fontSize:"12px",fontFamily:C.mono,textAlign:"right",outline:"none"}}/>
+                        </div>
+                        <div>
+                          <div style={{fontSize:"10px",color:C.muted,marginBottom:"3px"}}>분양률 (%)</div>
+                          <input value={item.saleRate} onChange={e=>D("RI",{id:bldg.id,rid:item.id,k:"saleRate",v:e.target.value})} placeholder="100"
+                            style={{width:"100%",boxSizing:"border-box",border:`1px solid ${C.border}`,borderRadius:"5px",padding:"5px 8px",fontSize:"12px",fontFamily:C.mono,textAlign:"right",outline:"none"}}/>
+                        </div>
+                        <div>
+                          <div style={{fontSize:"10px",color:C.muted,marginBottom:"3px"}}>분양면적 (자동/직접입력)</div>
+                          <input value={item.grossAreaOverride} onChange={e=>D("RI",{id:bldg.id,rid:item.id,k:"grossAreaOverride",v:e.target.value})} placeholder={`자동: ${fmt(item.grossArea)} ㎡`}
+                            style={{width:"100%",boxSizing:"border-box",border:`1px solid ${C.border}`,borderRadius:"5px",padding:"5px 8px",fontSize:"12px",fontFamily:C.mono,textAlign:"right",outline:"none"}}/>
+                        </div>
+                        <div style={{display:"flex",flexDirection:"column",justifyContent:"flex-end"}}>
+                          <div style={{fontSize:"9px",color:C.muted}}>분양수입 (자동계산)</div>
+                          <div style={{fontFamily:C.mono,fontSize:"14px",color:"#dc2626",fontWeight:700}}>{fM(item.itemSaleIncome)}</div>
+                          <div style={{fontSize:"9px",color:C.muted}}>{fmt(item.itemSaleArea)} ㎡ × {fM(n(item.salePriceUnit))} × {item.saleRate}%</div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  {/* 임대 입력 */}
+                  {isRent&&(
+                    <div style={{flex:"1 1 280px",padding:"8px 12px",background:"#f0fdf4"}}>
+                      <div style={{fontSize:"10px",color:C.green,fontWeight:700,marginBottom:"7px"}}>🏠 임대 계획</div>
+                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"7px"}}>
+                        <div>
+                          <div style={{fontSize:"10px",color:C.muted,marginBottom:"3px"}}>월 임대단가 (원/㎡)</div>
+                          <input value={item.rentUnit} onChange={e=>D("RI",{id:bldg.id,rid:item.id,k:"rentUnit",v:e.target.value})} placeholder="0"
+                            style={{width:"100%",boxSizing:"border-box",border:`1px solid ${C.border}`,borderRadius:"5px",padding:"5px 8px",fontSize:"12px",fontFamily:C.mono,textAlign:"right",outline:"none"}}/>
+                        </div>
+                        <div>
+                          <div style={{fontSize:"10px",color:C.muted,marginBottom:"3px"}}>보증금단가 (원/㎡)</div>
+                          <input value={item.depositUnit} onChange={e=>D("RI",{id:bldg.id,rid:item.id,k:"depositUnit",v:e.target.value})} placeholder="0"
+                            style={{width:"100%",boxSizing:"border-box",border:`1px solid ${C.border}`,borderRadius:"5px",padding:"5px 8px",fontSize:"12px",fontFamily:C.mono,textAlign:"right",outline:"none"}}/>
+                        </div>
+                        <div>
+                          <div style={{fontSize:"9px",color:C.muted}}>임대 전용면적</div>
+                          <div style={{fontFamily:C.mono,fontSize:"13px",color:C.green,fontWeight:700}}>{fmt(item.itemRentExcl)} ㎡</div>
+                        </div>
+                        <div>
+                          <div style={{fontSize:"9px",color:C.muted}}>연 임대수입</div>
+                          <div style={{fontFamily:C.mono,fontSize:"14px",color:C.green,fontWeight:700}}>{fM(item.ann)}</div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div style={{marginTop:"10px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:"8px"}}>
           <Btn sm variant="ghost" onClick={()=>D("ADD_RI",{id:bldg.id})}>＋ 용도 추가</Btn>
-          <div style={{fontFamily:C.mono,fontSize:"13px",color:bt.color,fontWeight:700}}>연 임대수입: {fM(rv.annual)} 원</div>
+          <div style={{display:"flex",gap:"16px"}}>
+            {rv.saleIncome>0&&<div style={{fontFamily:C.mono,fontSize:"12px",color:"#dc2626",fontWeight:700}}>분양수입: {fM(rv.saleIncome)}</div>}
+            {rv.annual>0&&<div style={{fontFamily:C.mono,fontSize:"12px",color:C.green,fontWeight:700}}>연 임대수입: {fM(rv.annual)}</div>}
+          </div>
         </div>
       </Card>
+
+      {/* 분양 수지 요약 (분양 있는 경우만) */}
+      {hasSale&&(
+        <Card title="분양 수지 요약" tag="SALE SUMMARY" accentBar="#dc2626">
+          <G cols="repeat(auto-fit,minmax(130px,1fr))">
+            <KpiCard label="총 분양수입" value={fM(rv.saleIncome)} unit="" large/>
+            <KpiCard label="분양 배분 사업비" value={fM(rv.saleTDC)} unit=""/>
+            <KpiCard label="분양 개발이익" value={fM(rv.saleProfit)} unit="" ok2={rv.saleProfit>0} warn={rv.saleProfit<0}/>
+            <KpiCard label="사업수지율" value={fP(rv.saleSujiRate)} unit="%" ok2={rv.saleSujiRate>=110} warn={rv.saleSujiRate<100}
+              sub="분양수입÷배분사업비"/>
+            <KpiCard label="총 분양면적" value={fmt(rv.totalSaleArea)} sub="층합계 기준"/>
+            <KpiCard label="임대 보유 배분 TDC" value={fM(rv.rentTDC)} unit=""/>
+          </G>
+          <div style={{marginTop:"10px",padding:"8px 12px",background:C.amberBg,borderRadius:"7px",fontSize:"10px",color:C.amber,lineHeight:1.7}}>
+            ⚠ 분양 배분 사업비 = TDC × (분양면적 / 지상 층합계). 실무에서는 직접공사비·간접비를 분리해 배분하지만 타당성 단계에서는 면적 비율 배분을 적용합니다.
+          </div>
+        </Card>
+      )}
 
       <Card title="보증금·공실·운영비" tag="COMMON PARAMS" accentBar={bt.color}>
         <G cols="repeat(auto-fit,minmax(140px,1fr))">
@@ -1229,8 +1255,13 @@ function AnalysisTab({state,dispatch,allCalcs}){
   const totLoan=targets.reduce((s,c)=>s+c.cost.loan,0);
   const totAnn=targets.reduce((s,c)=>s+c.rev.annual,0);
   const totEq=totTDC-totLoan;
+  const totSaleIncome=targets.reduce((s,c)=>s+(c.rev.saleIncome||0),0);
+  const totSaleProfit=targets.reduce((s,c)=>s+(c.rev.saleProfit||0),0);
+  const totSaleTDC=targets.reduce((s,c)=>s+(c.rev.saleTDC||0),0);
+  const totRentLoan=targets.reduce((s,c)=>s+(c.rev.rentLoan||c.cost.loan),0);
+  const hasSale=totSaleIncome>0;
   const capRate=totTDC>0?totNOI/totTDC*100:0;
-  const ana=totTDC>0&&(totNOI!==0||totEq>0)?calcAnalysis(totTDC,totEq,totLoan,totNOI,totAnn,anlys):null;
+  const ana=totTDC>0&&(totNOI!==0||totEq>0)?calcAnalysis(totTDC,totEq,totLoan,totNOI,totAnn,anlys,{saleIncome:totSaleIncome,saleProfit:totSaleProfit,saleTDC:totSaleTDC,rentLoan:totRentLoan}):null;
   const sig=(v,good,ok)=>v===null?C.muted:v>=good?C.green:v>=ok?C.amber:C.red;
   const thS={padding:"7px 9px",fontSize:"10px",color:C.muted,fontWeight:700,borderRight:`1px solid ${C.border}`,whiteSpace:"nowrap"};
 
@@ -1246,9 +1277,16 @@ function AnalysisTab({state,dispatch,allCalcs}){
         <G cols="repeat(auto-fit,minmax(110px,1fr))" mt="10px">
           <KpiCard label="총사업비 (TDC)" value={fM(totTDC)} unit=""/>
           <KpiCard label="자기자본" value={fM(totEq)} unit=""/>
-          <KpiCard label="연 NOI" value={fM(totNOI)} unit="" hi/>
-          <KpiCard label="Cap Rate" value={fP(capRate)} unit="%" hi/>
+          {hasSale&&<KpiCard label="분양수입 (일시)" value={fM(totSaleIncome)} unit="" ok2/>}
+          {hasSale&&<KpiCard label="분양 개발이익" value={fM(totSaleProfit)} unit="" ok2={totSaleProfit>0} warn={totSaleProfit<0}/>}
+          <KpiCard label="연 NOI (임대)" value={fM(totNOI)} unit="" hi/>
+          <KpiCard label="Cap Rate (임대)" value={fP(capRate)} unit="%" hi/>
         </G>
+        {hasSale&&(
+          <div style={{marginTop:"10px",padding:"9px 13px",background:"#fff0f0",border:`1px solid #dc262630`,borderRadius:"8px",fontSize:"10px",color:"#dc2626",lineHeight:1.7}}>
+            <strong>혼합 사업 현금흐름 구조:</strong> 준공 시 분양수입({fM(totSaleIncome)}) 일시 유입 → 이후 임대 NOI 지속 발생 → 보유기간 말 임대 자산 매각. 통합 IRR은 이 세 가지를 합산한 단일 현금흐름 기준입니다.
+          </div>
+        )}
       </Card>
 
       <Card title="분석 파라미터" tag="PARAMETERS">
@@ -1261,76 +1299,37 @@ function AnalysisTab({state,dispatch,allCalcs}){
           <TInput label="임대료 상승률 (DCF)" value={anlys.rentEscR} onChange={uA("rentEscR")} unit="%"/>
           <TInput label="상승 주기" value={anlys.rentEscPeriod} onChange={uA("rentEscPeriod")} unit="년"/>
         </G>
-        {/* 회계사 기능 추가 파라미터 */}
-        <div style={{marginTop:"12px",paddingTop:"12px",borderTop:`1px dashed ${C.border}`}}>
-          <div style={{fontSize:"10px",fontWeight:700,color:C.purple,marginBottom:"8px",letterSpacing:"0.04em"}}>⚖️ 세금 · 대출 · 출구 설정</div>
-          <G cols="repeat(auto-fit,minmax(160px,1fr))">
-            {/* 대출 상환 방식 */}
-            <div>
-              <div style={{fontSize:"11px",color:C.muted,marginBottom:"4px",fontWeight:600}}>대출 상환 방식</div>
-              <select value={anlys.repayType} onChange={e=>uA("repayType")(e.target.value)}
-                style={{width:"100%",border:`1.5px solid ${C.border}`,borderRadius:"7px",padding:"7px 10px",fontSize:"12px",fontFamily:C.sans,outline:"none",background:"#fff",color:C.text}}>
-                <option value="bullet">만기일시상환</option>
-                <option value="annuity">원리금균등상환</option>
-                <option value="principal">원금균등상환</option>
-              </select>
-            </div>
-            {/* 사업 주체 */}
-            <div>
-              <div style={{fontSize:"11px",color:C.muted,marginBottom:"4px",fontWeight:600}}>사업 주체</div>
-              <select value={anlys.entityType} onChange={e=>uA("entityType")(e.target.value)}
-                style={{width:"100%",border:`1.5px solid ${C.border}`,borderRadius:"7px",padding:"7px 10px",fontSize:"12px",fontFamily:C.sans,outline:"none",background:"#fff",color:C.text}}>
-                <option value="corp">법인 (법인세)</option>
-                <option value="indiv">개인 (종합소득세)</option>
-              </select>
-            </div>
-            <TInput label="매각 시점 (빈값=보유기간)" value={anlys.saleYear} onChange={uA("saleYear")} unit="년차" placeholder={anlys.holdYears}/>
-          </G>
-          {/* 자금집행 비율 */}
-          <div style={{marginTop:"10px"}}>
-            <div style={{fontSize:"10px",color:C.muted,fontWeight:700,marginBottom:"6px"}}>자금집행 비율 (합계 100%)</div>
-            <G cols="repeat(4,1fr)">
-              <TInput label="착공 전" value={anlys.fundPreR} onChange={uA("fundPreR")} unit="%"/>
-              <TInput label="골조공사" value={anlys.fundFrameR} onChange={uA("fundFrameR")} unit="%"/>
-              <TInput label="준공" value={anlys.fundCompR} onChange={uA("fundCompR")} unit="%"/>
-              <TInput label="임대안정화" value={anlys.fundStabR} onChange={uA("fundStabR")} unit="%"/>
-            </G>
-            {(()=>{ const tot=n(anlys.fundPreR)+n(anlys.fundFrameR)+n(anlys.fundCompR)+n(anlys.fundStabR); return tot!==100?<div style={{fontSize:"10px",color:C.red,marginTop:"4px",fontWeight:600}}>⚠ 합계 {fP(tot)}% — 100%가 되도록 조정하세요</div>:null; })()}
-          </div>
-          {/* 출구 시나리오 선택 */}
-          <div style={{marginTop:"10px"}}>
-            <div style={{fontSize:"10px",color:C.muted,fontWeight:700,marginBottom:"6px"}}>출구 시나리오 선택</div>
-            <div style={{display:"flex",gap:"9px",flexWrap:"wrap"}}>
-              {[["exitSale","🏷 매각"],["exitHold","🏠 장기보유"],["exitRefi","🔄 리파이낸싱"]].map(([k,lbl])=>(
-                <button key={k} onClick={()=>D("ANLYS_TOGGLE",{k})}
-                  style={{padding:"5px 13px",borderRadius:"18px",border:`1.5px solid ${anlys[k]?C.accent:C.border}`,background:anlys[k]?C.accentBg:"#fff",color:anlys[k]?C.accent:C.muted,fontSize:"11px",fontWeight:anlys[k]?700:400,cursor:"pointer",fontFamily:C.sans,transition:"all 0.15s"}}>
-                  {lbl}
-                </button>
-              ))}
-            </div>
-          </div>
-          {/* 리파이낸싱 조건 (선택 시만 표시) */}
-          {anlys.exitRefi&&(
-            <div style={{marginTop:"9px",padding:"10px",background:C.accentBg,borderRadius:"8px",border:`1px solid ${C.accent}30`}}>
-              <div style={{fontSize:"10px",color:C.accent,fontWeight:700,marginBottom:"7px"}}>🔄 리파이낸싱 조건</div>
-              <G cols="repeat(2,1fr)">
-                <TInput label="재대출 LTV" value={anlys.refiLtvR} onChange={uA("refiLtvR")} unit="%"/>
-                <TInput label="재대출 금리" value={anlys.refiR} onChange={uA("refiR")} unit="%"/>
-              </G>
-            </div>
-          )}
-        </div>
       </Card>
 
       {!ana?(
         <div style={{textAlign:"center",padding:"40px 20px",color:C.muted,fontSize:"13px",background:C.card,borderRadius:"12px",border:`1.5px solid ${C.border}`,lineHeight:2}}>
-          사업비와 임대수입 데이터를 먼저 입력해주세요.
+          사업비와 수익 데이터를 먼저 입력해주세요.
         </div>
       ):(
         <>
-          <Card title="① 단순 수익률" tag="SIMPLE RETURN">
+          {/* ─ 분양 수지 (분양 있을 때만) ─ */}
+          {hasSale&&(
+            <Card title="① 분양 수지" tag="SALE SUMMARY" accentBar="#dc2626">
+              <G cols="repeat(auto-fit,minmax(130px,1fr))">
+                <KpiCard label="분양수입" value={fM(totSaleIncome)} unit="" large/>
+                <KpiCard label="배분 사업비" value={fM(totSaleTDC)} unit=""/>
+                <KpiCard label="분양 개발이익" value={fM(totSaleProfit)} unit="" ok2={totSaleProfit>0} warn={totSaleProfit<0}
+                  sub={`사업수지율 ${fP(totSaleTDC>0?totSaleIncome/totSaleTDC*100:0)}%`}/>
+                <div style={{background:"#fff",border:`1.5px solid ${C.border}`,borderRadius:"9px",padding:"11px 13px",boxShadow:C.shadow}}>
+                  <div style={{fontSize:"10px",color:C.muted,fontWeight:600,marginBottom:"5px"}}>개발이익률</div>
+                  <div style={{fontFamily:C.mono,fontSize:"19px",color:totSaleProfit>0?C.green:C.red,fontWeight:700}}>
+                    {totSaleTDC>0?fP(totSaleProfit/totSaleTDC*100):"—"}%
+                  </div>
+                  <div style={{fontSize:"9px",color:C.muted,marginTop:"4px"}}>개발이익÷배분사업비</div>
+                </div>
+              </G>
+            </Card>
+          )}
+
+          {/* ─ 단순 수익률 ─ */}
+          <Card title={hasSale?"② 임대 단순 수익률":"① 단순 수익률"} tag="SIMPLE RETURN · 임대 파트">
             <G cols="repeat(auto-fit,minmax(140px,1fr))">
-              {[["Cap Rate",fP(ana.capRate)+"%",sig(ana.capRate,5,3),"NOI÷TDC"],["Cash-on-Cash",fP(ana.coc)+"%",sig(ana.coc,8,5),"세전CF÷Equity"],["Gross Yield",fP(ana.grossY)+"%",C.mid,"임대수입÷TDC"],["투자회수기간",ana.payback!==null?fP(ana.payback,1)+"년":"—",C.mid,"누적CF 기준"]].map(([l,v,c,sub])=>(
+              {[["Cap Rate",fP(ana.capRate)+"%",sig(ana.capRate,5,3),"NOI÷TDC"],["Cash-on-Cash",fP(ana.coc)+"%",sig(ana.coc,8,5),"세전CF÷전체Equity"],["Gross Yield",fP(ana.grossY)+"%",C.mid,"임대수입÷TDC"],["투자회수기간",ana.payback!==null?fP(ana.payback,1)+"년":"—",C.mid,"통합CF 기준"]].map(([l,v,c,sub])=>(
                 <div key={l} style={{background:"#fff",border:`1.5px solid ${C.border}`,borderRadius:"9px",padding:"11px 13px",boxShadow:C.shadow}}>
                   <div style={{fontSize:"10px",color:C.muted,fontWeight:600,marginBottom:"5px"}}>{l}</div>
                   <div style={{fontFamily:C.mono,fontSize:"19px",color:c,fontWeight:700}}>{v}</div>
@@ -1340,7 +1339,13 @@ function AnalysisTab({state,dispatch,allCalcs}){
             </G>
           </Card>
 
-          <Card title="② DCF / NPV / IRR (임대료 상승 반영)" tag="DISCOUNTED CASH FLOW">
+          <Card title={hasSale?`${hasSale?"③":"②"} DCF / NPV / IRR (통합 — 분양+임대)`: "② DCF / NPV / IRR"} tag="DISCOUNTED CASH FLOW · 임대료 상승 반영">
+            {hasSale&&(
+              <div style={{marginBottom:"10px",padding:"8px 12px",background:"#fff0f0",border:`1px solid #dc262630`,borderRadius:"7px",fontSize:"10px",color:"#dc2626",lineHeight:1.7}}>
+                0년차 현금흐름 = −전체자기자본 + 분양수입({fM(totSaleIncome)}) 일시수령.
+                이후 임대 NOI({fM(totNOI)}/년) 지속, 만기 임대자산 출구가치 실현.
+              </div>
+            )}
             <G cols="repeat(auto-fit,minmax(140px,1fr))">
               <div style={{background:ana.NPV>0?C.greenBg:C.redBg,border:`1.5px solid ${ana.NPV>0?C.green:C.red}30`,borderRadius:"9px",padding:"11px 13px"}}>
                 <div style={{fontSize:"10px",color:C.muted,fontWeight:600,marginBottom:"4px"}}>NPV ({anlys.discountR}% 할인)</div>
@@ -1348,26 +1353,27 @@ function AnalysisTab({state,dispatch,allCalcs}){
                 <div style={{fontSize:"9px",color:ana.NPV>0?C.green:C.red,marginTop:"4px"}}>{ana.NPV>0?"✓ 타당":"✗ 재검토"}</div>
               </div>
               <div style={{background:ana.IRR!==null&&ana.IRR>=n(anlys.discountR)?C.greenBg:C.redBg,border:`1.5px solid ${ana.IRR!==null&&ana.IRR>=n(anlys.discountR)?C.green:C.red}30`,borderRadius:"9px",padding:"11px 13px"}}>
-                <div style={{fontSize:"10px",color:C.muted,fontWeight:600,marginBottom:"4px"}}>IRR</div>
+                <div style={{fontSize:"10px",color:C.muted,fontWeight:600,marginBottom:"4px"}}>통합 IRR {hasSale?"(분양+임대)":""}</div>
                 <div style={{fontFamily:C.mono,fontSize:"19px",color:sig(ana.IRR,n(anlys.discountR)+2,n(anlys.discountR)),fontWeight:700}}>{ana.IRR!==null?fP(ana.IRR)+"%":"산출불가"}</div>
                 <div style={{fontSize:"9px",color:C.muted,marginTop:"4px"}}>hurdle {anlys.discountR}%</div>
               </div>
-              <KpiCard label="출구가치 (TV)" value={fM(ana.tv)} unit="" sub={`Cap ${anlys.exitCapR}% 기준`}/>
-              <KpiCard label="연초 세전 CF" value={fM(ana.yearNOIs[0]-ana.debtSvc)} unit=""/>
+              <KpiCard label="출구가치 (TV)" value={fM(ana.tv)} unit="" sub={`임대자산 Cap ${anlys.exitCapR}%`}/>
+              <KpiCard label="임대 연초 세전 CF" value={fM(ana.yearNOIs[0]-ana.debtSvc)} unit=""/>
             </G>
             <div style={{overflowX:"auto",border:`1.5px solid ${C.border}`,borderRadius:"8px",marginTop:"11px"}}>
               <table style={{width:"100%",borderCollapse:"collapse",minWidth:"400px"}}>
-                <thead><tr style={{background:C.cardAlt}}>{["연도","연 NOI","현금흐름","누적 CF","현재가치","누적 NPV"].map((h,i)=><th key={i} style={{...thS,textAlign:i===0?"left":"right"}}>{h}</th>)}</tr></thead>
+                <thead><tr style={{background:C.cardAlt}}>{["연도","비고","현금흐름","누적 CF","현재가치","누적 NPV"].map((h,i)=><th key={i} style={{...thS,textAlign:i===0?"left":"right"}}>{h}</th>)}</tr></thead>
                 <tbody>
                   {ana.cfs.map((cf,y)=>{
                     const pv=cf/(1+ana.dr)**y;
                     const cumCf=ana.cfs.slice(0,y+1).reduce((s,c)=>s+c,0);
                     const cumPv=ana.cfs.slice(0,y+1).reduce((s,c,t)=>s+c/(1+ana.dr)**t,0);
-                    const yn=y===0?0:(ana.yearNOIs[Math.min(y-1,ana.yearNOIs.length-1)]||0);
+                    const yn=y===0?null:(ana.yearNOIs[Math.min(y-1,ana.yearNOIs.length-1)]||0);
+                    const note=y===0?(hasSale?`투자+분양수령`:"초기투자"):`NOI ${fM(yn)}`;
                     return(
-                      <tr key={y} style={{borderBottom:`1px solid ${C.faint}`,background:y%2?C.cardAlt:"#fff"}}>
-                        <td style={{padding:"5px 9px",fontSize:"10px",color:C.muted,fontWeight:y===0?700:400,borderRight:`1px solid ${C.border}`}}>{y===0?"초기투자":`${y}년차`}</td>
-                        <td style={{padding:"5px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"11px",color:C.mid,borderRight:`1px solid ${C.border}`}}>{y===0?"—":fM(yn)}</td>
+                      <tr key={y} style={{borderBottom:`1px solid ${C.faint}`,background:y===0?"#fff5f5":y%2?C.cardAlt:"#fff"}}>
+                        <td style={{padding:"5px 9px",fontSize:"10px",color:C.muted,fontWeight:y===0?700:400,borderRight:`1px solid ${C.border}`}}>{y===0?"0년차":`${y}년차`}</td>
+                        <td style={{padding:"5px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"10px",color:C.muted,borderRight:`1px solid ${C.border}`}}>{note}</td>
                         {[cf,cumCf,pv,cumPv].map((v,i)=>(
                           <td key={i} style={{padding:"5px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"11px",color:v<0?C.red:v===0?C.muted:C.green,fontWeight:i===0?600:400,borderRight:i<3?`1px solid ${C.border}`:"none"}}>
                             {v<0?`(${fM(Math.abs(v))})`:fM(v)}
@@ -1381,7 +1387,7 @@ function AnalysisTab({state,dispatch,allCalcs}){
             </div>
           </Card>
 
-          <Card title="③ B/C 분석" tag="BENEFIT-COST">
+          <Card title={hasSale?"④ B/C 분석":"③ B/C 분석"} tag="BENEFIT-COST">
             <G cols="repeat(3,1fr)">
               <div style={{background:ana.bc>=1?C.greenBg:C.redBg,border:`1.5px solid ${ana.bc>=1?C.green:C.red}30`,borderRadius:"9px",padding:"11px 13px"}}>
                 <div style={{fontSize:"10px",color:C.muted,fontWeight:600,marginBottom:"4px"}}>B/C ({anlys.bcYears}년)</div>
@@ -1393,10 +1399,10 @@ function AnalysisTab({state,dispatch,allCalcs}){
             </G>
           </Card>
 
-          <Card title="④ NOI 민감도 분석" tag="SENSITIVITY">
+          <Card title={hasSale?"⑤ NOI 민감도 분석":"④ NOI 민감도 분석"} tag="SENSITIVITY · 임대 NOI 기준">
             <div style={{overflowX:"auto",border:`1.5px solid ${C.border}`,borderRadius:"8px"}}>
               <table style={{width:"100%",borderCollapse:"collapse"}}>
-                <thead><tr style={{background:C.cardAlt}}>{["NOI 변동","NOI (연)","연 CF","NPV","IRR","판정"].map((h,i)=><th key={i} style={{...thS,textAlign:i===0?"left":"right"}}>{h}</th>)}</tr></thead>
+                <thead><tr style={{background:C.cardAlt}}>{["NOI 변동","NOI (연)","연 CF","NPV","통합IRR","판정"].map((h,i)=><th key={i} style={{...thS,textAlign:i===0?"left":"right"}}>{h}</th>)}</tr></thead>
                 <tbody>
                   {ana.sens.map(s=>{
                     const base=s.dp===0;
@@ -1415,202 +1421,6 @@ function AnalysisTab({state,dispatch,allCalcs}){
               </table>
             </div>
           </Card>
-
-          {/* ════════════════════════════════════════
-              회계사 기능 ⑤~⑧
-          ════════════════════════════════════════ */}
-          {(()=>{
-            const totConstr=targets.reduce((s,c)=>s+c.cost.constr,0);
-            const sc=calcScenario(totTDC,totEq,totLoan,totNOI,totConstr,anlys);
-            const {annualRows,schedule,fundStages}=sc;
-
-            return(<>
-
-          {/* ⑤ 연도별 P&L 테이블 (세후) */}
-          <Card title="⑤ 연도별 손익 및 현금흐름 (세후)" tag="P&L · AFTER-TAX CF" accentBar={C.purple} collapsible defaultOpen={true}>
-            <div style={{fontSize:"10px",color:C.muted,marginBottom:"8px"}}>
-              감가상각: 공사비 ÷ 40년 정액법 · 법인세: {anlys.entityType==="corp"?"법인세율 9~24%":"종합소득세율 6~45%"} 누진 · 이자비용 손금산입 반영
-            </div>
-            <div style={{overflowX:"auto",border:`1.5px solid ${C.border}`,borderRadius:"8px"}}>
-              <table style={{width:"100%",borderCollapse:"collapse",minWidth:"700px"}}>
-                <thead>
-                  <tr style={{background:C.cardAlt}}>
-                    {["연도","NOI","이자비용","원금상환","감가상각","과세소득","법인세","순이익","세후 CF","잔여대출"].map((h,i)=>(
-                      <th key={i} style={{...thS,textAlign:i===0?"left":"right",fontSize:"9px"}}>{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {annualRows.map((r,i)=>(
-                    <tr key={r.yr} style={{borderBottom:`1px solid ${C.faint}`,background:i%2?C.cardAlt:"#fff"}}>
-                      <td style={{padding:"5px 9px",fontSize:"10px",color:C.muted,fontWeight:600,borderRight:`1px solid ${C.border}`,whiteSpace:"nowrap"}}>{r.yr}년차</td>
-                      {[r.noi,r.interest,r.principal,r.depre,r.taxable,r.tax,r.netIncome,r.afterTaxCF,r.balance].map((v,j)=>{
-                        const isNeg=[5,6,7].includes(j)&&v<0;
-                        const isCF=j===7;
-                        const color=isCF?(v>=0?C.green:C.red):j===5?(v>0?C.mid:C.muted):C.mid;
-                        return(
-                          <td key={j} style={{padding:"5px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"10px",color,fontWeight:isCF?700:400,borderRight:j<8?`1px solid ${C.border}`:"none"}}>
-                            {v<0?`(${fM(Math.abs(v))})`:fM(v)}
-                          </td>
-                        );
-                      })}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </Card>
-
-          {/* ⑥ DSCR 연도별 테이블 */}
-          <Card title="⑥ 부채상환비율 (DSCR) 연도별" tag="DEBT SERVICE COVERAGE RATIO" accentBar={C.teal} collapsible defaultOpen={true}>
-            <div style={{fontSize:"10px",color:C.muted,marginBottom:"8px"}}>
-              DSCR = NOI ÷ 연간원리금상환액 · DSCR &lt; 1.2 구간은 금융기관 심사에서 위험 신호로 판단됩니다
-            </div>
-            <div style={{overflowX:"auto",border:`1.5px solid ${C.border}`,borderRadius:"8px"}}>
-              <table style={{width:"100%",borderCollapse:"collapse",minWidth:"500px"}}>
-                <thead>
-                  <tr style={{background:C.cardAlt}}>
-                    {["연도","NOI","연간원리금","이자","원금","잔여대출","LTV추이","DSCR","판정"].map((h,i)=>(
-                      <th key={i} style={{...thS,textAlign:i===0?"left":"right",fontSize:"9px"}}>{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {annualRows.map((r,i)=>{
-                    const dscr=r.dscr;
-                    const dscrOk=dscr!==null&&dscr>=1.2;
-                    const dscrWarn=dscr!==null&&dscr>=1.0&&dscr<1.2;
-                    const ltvNow=totTDC>0?r.balance/totTDC*100:0;
-                    return(
-                      <tr key={r.yr} style={{borderBottom:`1px solid ${C.faint}`,background:(!dscrOk&&dscr!==null)?C.redBg:(i%2?C.cardAlt:"#fff")}}>
-                        <td style={{padding:"5px 9px",fontSize:"10px",color:C.muted,fontWeight:600,borderRight:`1px solid ${C.border}`}}>{r.yr}년차</td>
-                        <td style={{padding:"5px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"10px",color:C.mid,borderRight:`1px solid ${C.border}`}}>{fM(r.noi)}</td>
-                        <td style={{padding:"5px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"10px",color:C.text,fontWeight:600,borderRight:`1px solid ${C.border}`}}>{fM(r.payment)}</td>
-                        <td style={{padding:"5px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"10px",color:C.red,borderRight:`1px solid ${C.border}`}}>{fM(r.interest)}</td>
-                        <td style={{padding:"5px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"10px",color:C.mid,borderRight:`1px solid ${C.border}`}}>{fM(r.principal)}</td>
-                        <td style={{padding:"5px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"10px",color:C.muted,borderRight:`1px solid ${C.border}`}}>{fM(r.balance)}</td>
-                        <td style={{padding:"5px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"10px",color:C.muted,borderRight:`1px solid ${C.border}`}}>{fP(ltvNow)}%</td>
-                        <td style={{padding:"5px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"11px",color:dscrOk?C.green:dscrWarn?C.amber:C.red,fontWeight:700,borderRight:`1px solid ${C.border}`}}>
-                          {dscr!==null?fP(dscr,2):"—"}
-                        </td>
-                        <td style={{padding:"5px 9px",textAlign:"center",fontSize:"10px",fontWeight:600,color:dscrOk?C.green:dscrWarn?C.amber:C.red}}>
-                          {dscr===null?"—":dscrOk?"✓ 양호":dscrWarn?"△ 주의":"✗ 위험"}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-            <div style={{marginTop:"9px",display:"flex",gap:"14px",flexWrap:"wrap",fontSize:"10px"}}>
-              {[["✓ 양호",C.green,"DSCR ≥ 1.2"],["△ 주의",C.amber,"1.0 ≤ DSCR < 1.2"],["✗ 위험",C.red,"DSCR < 1.0"]].map(([l,c,desc])=>(
-                <div key={l} style={{display:"flex",alignItems:"center",gap:"5px"}}><span style={{color:c,fontWeight:700}}>{l}</span><span style={{color:C.muted}}>{desc}</span></div>
-              ))}
-            </div>
-          </Card>
-
-          {/* ⑦ 자금집행 타임라인 */}
-          <Card title="⑦ 자금조달·집행 계획" tag="FUNDING TIMELINE" accentBar={C.amber} collapsible defaultOpen={false}>
-            <div style={{fontSize:"10px",color:C.muted,marginBottom:"10px"}}>
-              TDC {fM(totTDC)} 기준 · 자기자본 {fM(totEq)} + PF대출 {fM(totLoan)} 단계별 집행
-            </div>
-            <div style={{display:"flex",flexDirection:"column",gap:"8px"}}>
-              {(()=>{
-                const stages=[
-                  {label:"착공 전",r:n(anlys.fundPreR),color:C.amber,desc:"토지취득·설계·인허가"},
-                  {label:"골조공사",r:n(anlys.fundFrameR),color:C.purple,desc:"기초·골조·설비"},
-                  {label:"준공",r:n(anlys.fundCompR),color:C.teal,desc:"마감·준공검사·인테리어"},
-                  {label:"임대안정화",r:n(anlys.fundStabR),color:C.accent,desc:"임차인 유치·안정화"},
-                ];
-                let cumEq=0, cumLoan=0;
-                return stages.map((st,i)=>{
-                  const eqAmt=totEq*st.r/100;
-                  const loanAmt=totLoan*st.r/100;
-                  const totalAmt=eqAmt+loanAmt;
-                  cumEq+=eqAmt; cumLoan+=loanAmt;
-                  const barW=st.r;
-                  return(
-                    <div key={i} style={{background:C.cardAlt,border:`1px solid ${C.border}`,borderRadius:"9px",padding:"11px 14px"}}>
-                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:"7px",flexWrap:"wrap",gap:"5px"}}>
-                        <div>
-                          <span style={{fontSize:"12px",fontWeight:700,color:st.color}}>● {st.label}</span>
-                          <span style={{fontSize:"10px",color:C.muted,marginLeft:"8px"}}>{st.desc}</span>
-                        </div>
-                        <div style={{display:"flex",gap:"14px",fontSize:"10px"}}>
-                          <span><span style={{color:C.muted}}>자기자본: </span><span style={{fontFamily:C.mono,fontWeight:600,color:C.green}}>{fM(eqAmt)}</span></span>
-                          <span><span style={{color:C.muted}}>PF대출: </span><span style={{fontFamily:C.mono,fontWeight:600,color:C.accent}}>{fM(loanAmt)}</span></span>
-                          <span><span style={{color:C.muted}}>소계: </span><span style={{fontFamily:C.mono,fontWeight:700,color:C.text}}>{fM(totalAmt)}</span></span>
-                          <span style={{color:C.muted}}>({fP(st.r)}%)</span>
-                        </div>
-                      </div>
-                      {/* 막대 그래프 */}
-                      <div style={{height:"8px",background:C.faint,borderRadius:"4px",overflow:"hidden"}}>
-                        <div style={{height:"100%",width:`${barW}%`,background:st.color,borderRadius:"4px",transition:"width 0.4s"}}/>
-                      </div>
-                      <div style={{display:"flex",justifyContent:"space-between",fontSize:"9px",color:C.muted,marginTop:"3px"}}>
-                        <span>누적 집행: {fM(cumEq+cumLoan)}</span>
-                        <span>잔여: {fM(totTDC-(cumEq+cumLoan))}</span>
-                      </div>
-                    </div>
-                  );
-                });
-              })()}
-            </div>
-          </Card>
-
-          {/* ⑧ 출구전략별 시나리오 비교 */}
-          <Card title="⑧ 출구전략별 세후 수익 시나리오" tag="EXIT SCENARIO · AFTER-TAX IRR / MOIC" accentBar={C.green} collapsible defaultOpen={true}>
-            <div style={{fontSize:"10px",color:C.muted,marginBottom:"10px"}}>
-              세후 현금흐름 기준 IRR 및 투자원금 회수 배수(MOIC). 상환방식: {
-                {"bullet":"만기일시상환","annuity":"원리금균등상환","principal":"원금균등상환"}[anlys.repayType]
-              } · {anlys.entityType==="corp"?"법인세":"종합소득세"} 반영
-            </div>
-            <div style={{display:"flex",flexDirection:"column",gap:"10px"}}>
-              {[
-                ...(anlys.exitSale?[{label:"🏷 매각 시나리오",desc:`${anlys.saleYear||anlys.holdYears}년차 Cap Rate ${anlys.exitCapR}% 기준 매각`,irr:sc.saleIRR,moic:sc.saleMOIC,color:C.green}]:[]),
-                ...(anlys.exitHold?[{label:"🏠 장기보유 시나리오",desc:`${anlys.holdYears}년 보유 후 Cap Rate ${anlys.exitCapR}% 기준 매각`,irr:sc.holdIRR,moic:sc.holdMOIC,color:C.teal}]:[]),
-                ...(anlys.exitRefi?[{label:"🔄 리파이낸싱 시나리오",desc:`재대출 LTV ${anlys.refiLtvR}% · 금리 ${anlys.refiR}% · 잉여현금 ${fM(sc.refiCashback)}`,irr:sc.refiIRR,moic:sc.refiMOIC,color:C.accent}]:[]),
-              ].map((s,i)=>{
-                const irrPct=s.irr!==null?s.irr*100:null;
-                const irrOk=irrPct!==null&&irrPct>=n(anlys.discountR);
-                const moicOk=s.moic!==null&&s.moic>=1.5;
-                return(
-                  <div key={i} style={{background:"#fff",border:`1.5px solid ${s.color}30`,borderRadius:"10px",padding:"13px 16px",boxShadow:C.shadow}}>
-                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:"8px"}}>
-                      <div>
-                        <div style={{fontSize:"13px",fontWeight:700,color:s.color,marginBottom:"3px"}}>{s.label}</div>
-                        <div style={{fontSize:"10px",color:C.muted}}>{s.desc}</div>
-                      </div>
-                      <div style={{display:"flex",gap:"20px",alignItems:"center"}}>
-                        <div style={{textAlign:"center"}}>
-                          <div style={{fontSize:"9px",color:C.muted,fontWeight:600,marginBottom:"3px"}}>세후 IRR</div>
-                          <div style={{fontFamily:C.mono,fontSize:"20px",color:irrOk?C.green:C.red,fontWeight:700}}>
-                            {irrPct!==null?fP(irrPct)+"%":"—"}
-                          </div>
-                          <div style={{fontSize:"9px",color:irrOk?C.green:C.red}}>{irrPct===null?"산출불가":irrOk?"✓ hurdle 초과":"✗ hurdle 미달"}</div>
-                        </div>
-                        <div style={{textAlign:"center"}}>
-                          <div style={{fontSize:"9px",color:C.muted,fontWeight:600,marginBottom:"3px"}}>MOIC</div>
-                          <div style={{fontFamily:C.mono,fontSize:"20px",color:moicOk?C.green:s.moic!==null&&s.moic>=1?C.amber:C.red,fontWeight:700}}>
-                            {s.moic!==null?fP(s.moic,2)+"x":"—"}
-                          </div>
-                          <div style={{fontSize:"9px",color:C.muted}}>투자원금 회수 배수</div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-              {(!anlys.exitSale&&!anlys.exitHold&&!anlys.exitRefi)&&(
-                <div style={{textAlign:"center",padding:"20px",color:C.muted,fontSize:"12px",background:C.cardAlt,borderRadius:"8px"}}>
-                  위 파라미터에서 출구 시나리오를 하나 이상 선택하세요.
-                </div>
-              )}
-            </div>
-          </Card>
-
-            </>);
-          })()}
         </>
       )}
     </div>
@@ -1620,7 +1430,7 @@ function AnalysisTab({state,dispatch,allCalcs}){
 // ═══════════════════════════════════════════════════════
 // § 13. 메인 앱
 // ═══════════════════════════════════════════════════════
-const TABS=[{id:"area",label:"면적표",icon:"📐"},{id:"cost",label:"사업비",icon:"💰"},{id:"rev",label:"임대수입",icon:"📈"},{id:"analysis",label:"사업성분석",icon:"🔍"},{id:"refs",label:"기준",icon:"📋"}];
+const TABS=[{id:"area",label:"면적표",icon:"📐"},{id:"cost",label:"사업비",icon:"💰"},{id:"rev",label:"수익 계획",icon:"📊"},{id:"analysis",label:"사업성분석",icon:"🔍"},{id:"refs",label:"기준",icon:"📋"}];
 
 export default function App(){
   const[state,dispatch]=useReducer(reducer,initState);
@@ -1641,6 +1451,7 @@ export default function App(){
   const activeCalc=allCalcs.find(c=>c.bldg.id===activeBldgId)||allCalcs[0];
   const totTDC=allCalcs.reduce((s,c)=>s+c.cost.tdc,0);
   const totNOI=allCalcs.reduce((s,c)=>s+c.rev.noi,0);
+  const totSaleAll=allCalcs.reduce((s,c)=>s+(c.rev.saleIncome||0),0);
   const cap=totTDC>0?totNOI/totTDC*100:0;
 
   return(
@@ -1656,7 +1467,12 @@ export default function App(){
         </div>
         {totTDC>0&&(
           <div style={{display:"flex",gap:"14px",flexWrap:"wrap"}}>
-            {[["TDC",fM(totTDC)],["NOI",fM(totNOI)],["Cap Rate",cap>0?fP(cap)+"%":"—"]].map(([l,v])=>(
+            {[
+              ["TDC",fM(totTDC)],
+              ...(totSaleAll>0?[["분양수입",fM(totSaleAll)]]:[] ),
+              ["NOI/년",fM(totNOI)],
+              ["Cap Rate",cap>0?fP(cap)+"%":"—"],
+            ].map(([l,v])=>(
               <div key={l} style={{textAlign:"right"}}><div style={{fontSize:"8px",color:"#64748b"}}>{l}</div><div style={{fontSize:"12px",fontFamily:C.mono,color:"#e2e8f0",fontWeight:700}}>{v}</div></div>
             ))}
           </div>
