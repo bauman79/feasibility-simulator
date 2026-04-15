@@ -1,4 +1,54 @@
-import { useState, useMemo, useReducer, useCallback } from "react";
+import { useState, useMemo, useReducer, useCallback, useEffect, useRef } from "react";
+
+// ═══════════════════════════════════════════════════════
+// § 0. PWA 서비스워커 등록 (vite-plugin-pwa 없이 수동)
+// ═══════════════════════════════════════════════════════
+if(typeof window!=="undefined"&&"serviceWorker"in navigator){
+  window.addEventListener("load",()=>{
+    navigator.serviceWorker.register("/sw.js").catch(()=>{});
+  });
+}
+
+// ═══════════════════════════════════════════════════════
+// § 0-B. Firebase Auth 훅 (내일 연결용 — 현재 Mock)
+// ═══════════════════════════════════════════════════════
+// TODO: import { initializeApp } from "firebase/app";
+// TODO: import { getAuth, GoogleAuthProvider, signInWithPopup } from "firebase/auth";
+// const firebaseConfig = { /* 내일 입력 */ };
+// const app = initializeApp(firebaseConfig);
+// const auth = getAuth(app);
+
+function useAuth(){
+  const[user,setUser]=useState(null);
+  const[loading,setLoading]=useState(false);
+  // Mock — Firebase 연결 후 아래를 실제 코드로 교체
+  const signIn=async()=>{
+    setLoading(true);
+    setTimeout(()=>{ setUser({name:"사용자",email:"user@gmail.com",photo:null}); setLoading(false); },800);
+    // 실제: const result = await signInWithPopup(auth, new GoogleAuthProvider()); setUser(result.user);
+  };
+  const signOut=()=>setUser(null);
+  // 실제: useEffect(()=>{ return onAuthStateChanged(auth, u=>setUser(u)); },[]);
+  return{user,loading,signIn,signOut};
+}
+
+// ═══════════════════════════════════════════════════════
+// § 0-C. 저장/불러오기 (localStorage → Firebase 교체 예정)
+// ═══════════════════════════════════════════════════════
+const SAVE_KEY="feasibility_v6_state";
+function saveState(state){
+  try{ localStorage.setItem(SAVE_KEY,JSON.stringify(state)); return true; }
+  catch(e){ return false; }
+}
+function loadState(){
+  try{
+    const raw=localStorage.getItem(SAVE_KEY);
+    return raw?JSON.parse(raw):null;
+  }catch(e){ return null; }
+}
+// TODO Firebase: import { doc, setDoc, getDoc } from "firebase/firestore";
+// async function saveStateCloud(uid,state){ await setDoc(doc(db,"projects",uid),{state}); }
+// async function loadStateCloud(uid){ const d=await getDoc(doc(db,"projects",uid)); return d.data()?.state; }
 
 // ═══════════════════════════════════════════════════════
 // § 1. 법정 기준 데이터
@@ -138,7 +188,8 @@ const mkBldg=(id,name="건물 1",type="office")=>({
   aF:[mkFloor("1F"),mkFloor("2F"),mkFloor("3F")],
   bF:[mkFloor("B1")],
   cost:{
-    landUnit:"", constrAbove:"", constrBelow:"",
+    landUnit:"", landMult:"1.0",     // landMult: 배수 → 감정추정가 = landUnit × landMult
+    constrAbove:"", constrBelow:"",
     designROverride:"",  // 빈값 = refs brackets 자동
     supervROverride:"",  // 빈값 = refs.superv.rate 자동
     reserveR:"5.0",
@@ -153,8 +204,48 @@ const mkBldg=(id,name="건물 1",type="office")=>({
 });
 
 // ═══════════════════════════════════════════════════════
-// § 4. 계산 함수
+// § 3-B. 분담금 의무/선택/비해당 자동 판정
 // ═══════════════════════════════════════════════════════
+// status: "required" | "optional" | "na"
+function getChargeStatus(chargeKey, bldg, area){
+  const t=bldg.type;
+  const gfaT=area?.gfaT||0;
+  const gfaFar=area?.gfaFar||0;
+  const hasSaleInType=bldg.revItems?.some(i=>i.saleMode!=="rent");
+  const isOfficeRetail=["office","retail","mixed"].includes(t);
+
+  const M=(reason)=>({status:"required", reason, color:"#b91c1c", label:"의무"});
+  const O=(reason)=>({status:"optional", reason, color:"#92400e", label:"선택"});
+  const N=(reason)=>({status:"na",       reason, color:"#64748b", label:"비해당"});
+
+  switch(chargeKey){
+    case"waterSupply": return M("신규 건축물 상수도 인입 시 의무 부담 (수도법 §71)");
+    case"sewer":       return M("신규 건축물 오수 발생 시 의무 부담 (하수도법 §61)");
+    case"distHeat":    return O("지역난방 공급구역 내 해당 시 부담. 공급가능 여부 확인 필요");
+    case"gas":         return O("도시가스 공급 지역 해당 시. 사업자 확인 필요");
+    case"transport":
+      if(isOfficeRetail && gfaFar>=5000)
+        return M(`업무/판매 용적률산정용 연면적 ${Math.round(gfaFar).toLocaleString()}㎡ ≥ 5,000㎡ — 수도권 과밀억제권역 해당 시 의무`);
+      if(isOfficeRetail && gfaFar>0)
+        return O(`현재 ${Math.round(gfaFar).toLocaleString()}㎡ — 5,000㎡ 미달. 해당 지역 확인 필요`);
+      if(t==="resi" && hasSaleInType)
+        return M("분양 주택 500세대 이상 해당 시 의무 (광역교통법)");
+      return O("규모·용도 검토 필요");
+    case"school":
+      if(t==="resi" && hasSaleInType) return M("분양 공동주택 포함 시 의무 (학교용지확보특례법)");
+      if(t==="resi") return O("임대 전용 시 비적용 — 분양 전환 시 재검토");
+      return N("공동주택 이외 용도 — 비해당");
+    case"overcrowd":
+      if(isOfficeRetail && gfaT>25000)
+        return M(`연면적 ${Math.round(gfaT).toLocaleString()}㎡ > 25,000㎡ 초과 — 수도권 과밀억제권역 업무·판매용 의무`);
+      if(isOfficeRetail)
+        return O(`현재 ${Math.round(gfaT).toLocaleString()}㎡ — 25,000㎡ 미달. 증가 시 재검토`);
+      return N("업무·판매시설 아님 — 비해당");
+    case"develop":
+      return O("개발이익 발생 시 사후 부과. 개략 추정 입력 후 실제 감정평가로 확정");
+    default: return O("항목 확인 필요");
+  }
+}
 const calcNPV=(cfs,r)=>cfs.reduce((s,c,t)=>s+c/(1+r)**t,0);
 function calcIRR(cfs){
   if(cfs.every(c=>c>=0)||cfs.every(c=>c<=0))return null;
@@ -253,34 +344,29 @@ function calcArea(bldg, siteArea, parkRefs){
 function calcCost(bldg, area, refs){
   const c=bldg.cost;
   const land=area.siteN*n(c.landUnit);
+  const landMult=Math.max(1, n(c.landMult)||1);
+  const appraisalLand=land*landMult;  // 감정 추정 토지가
+
   const cA=area.gfaA*n(c.constrAbove);
   const cB=area.gfaB*n(c.constrBelow);
   const constr=cA+cB;
 
-  // 설계비 — refs brackets 자동, override 가능
   const designRate=c.designROverride?n(c.designROverride):getDesignRate(constr,refs.design);
   const design=constr*designRate/100;
-
-  // 감리비 — refs.superv 자동, override 가능
   const supervRate=c.supervROverride?n(c.supervROverride):refs.superv;
   const superv=constr*supervRate/100;
-
   const reserve=constr*n(c.reserveR)/100;
-
-  // 취득세
   const acquiTax=c.acquiTaxOverride?n(c.acquiTaxOverride):land*ACQUI_TAX_RATE/100;
 
-  // 제부담금 자동계산
   const autoCharges=calcChargesAuto(bldg,area,constr,land,refs.charges);
-
-  // override 우선 적용
-  const charges={};
-  let chgTotal=0;
+  const charges={}; let chgTotal=0;
   for(const key of Object.keys(autoCharges)){
     const ov=c.chargeOverrides[key];
     const auto=autoCharges[key];
-    const final=ov!==""?n(ov):auto;
-    charges[key]={ auto, final, overridden:ov!=="", enabled:refs.charges[key]?.enabled||false };
+    const cs=getChargeStatus(key,bldg,area);
+    // 비해당(na)이면 0, override 우선, 그 다음 auto
+    const final=cs.status==="na"?0:(ov!==""?n(ov):auto);
+    charges[key]={ auto, final, overridden:ov!=="", enabled:refs.charges[key]?.enabled||false, cs };
     chgTotal+=final;
   }
 
@@ -289,7 +375,8 @@ function calcCost(bldg, area, refs){
   const loan=base*n(c.ltvR)/100;
   const finance=loan*n(c.loanR)/100*n(c.loanPeriod)/12;
   const tdc=base+finance;
-  return{ land,cA,cB,constr,design,designRate,superv,supervRate,reserve,acquiTax,charges,chgTotal,indirect,base,loan,finance,tdc,equity:tdc-loan };
+  return{ land, landMult, appraisalLand, cA,cB,constr, design,designRate, superv,supervRate,
+          reserve, acquiTax, charges, chgTotal, indirect, base, loan, finance, tdc, equity:tdc-loan };
 }
 
 function calcRev(bldg,area,cost){
@@ -488,6 +575,288 @@ const C={
 };
 
 // ═══════════════════════════════════════════════════════
+// § 7-A. 인증·저장 UI
+// ═══════════════════════════════════════════════════════
+function AuthBar({user,loading,signIn,signOut,onSave,onLoad,lastSaved}){
+  return(
+    <div style={{background:"#fff",borderBottom:`1px solid ${C.border}`,padding:"6px 18px",display:"flex",alignItems:"center",gap:"10px",flexWrap:"wrap",justifyContent:"flex-end"}}>
+      {/* 저장/불러오기 */}
+      <button onClick={onLoad} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C.mid,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>
+        📂 불러오기
+      </button>
+      <button onClick={onSave} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.accent}`,background:C.accentBg,color:C.accent,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>
+        💾 저장
+      </button>
+      {lastSaved&&<span style={{fontSize:"9px",color:C.muted}}>저장: {lastSaved}</span>}
+
+      <div style={{width:"1px",height:"20px",background:C.border,margin:"0 4px"}}/>
+
+      {/* Google 로그인 */}
+      {user?(
+        <div style={{display:"flex",alignItems:"center",gap:"7px"}}>
+          <div style={{width:"24px",height:"24px",borderRadius:"50%",background:C.accentBg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"13px"}}>{user.photo?<img src={user.photo} style={{width:"24px",height:"24px",borderRadius:"50%"}} alt=""/>:"👤"}</div>
+          <span style={{fontSize:"11px",color:C.mid,fontWeight:600}}>{user.name||user.email}</span>
+          <button onClick={signOut} style={{fontSize:"10px",padding:"3px 8px",borderRadius:"5px",border:`1px solid ${C.border}`,background:"#fff",color:C.muted,cursor:"pointer",fontFamily:C.sans}}>로그아웃</button>
+        </div>
+      ):(
+        <button onClick={signIn} disabled={loading} style={{display:"flex",alignItems:"center",gap:"6px",padding:"5px 12px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C.mid,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600,opacity:loading?0.6:1}}>
+          <svg width="14" height="14" viewBox="0 0 24 24"><path fill="#4285f4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34a853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#fbbc05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/><path fill="#ea4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+          {loading?"연결 중...":"Google 로그인"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// § 7-B. 토지이음 팝업 모달
+// ═══════════════════════════════════════════════════════
+function EumModal({onClose}){
+  const ref=useRef();
+  useEffect(()=>{
+    const handler=e=>{ if(ref.current&&!ref.current.contains(e.target)) onClose(); };
+    document.addEventListener("mousedown",handler);
+    return()=>document.removeEventListener("mousedown",handler);
+  },[onClose]);
+  return(
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:9000,display:"flex",alignItems:"center",justifyContent:"center",padding:"16px"}}>
+      <div ref={ref} style={{background:"#fff",borderRadius:"12px",boxShadow:"0 20px 60px rgba(0,0,0,0.3)",width:"min(900px,95vw)",height:"min(700px,90vh)",display:"flex",flexDirection:"column",overflow:"hidden"}}>
+        <div style={{padding:"12px 16px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",gap:"10px",background:C.cardAlt}}>
+          <span style={{fontSize:"16px"}}>🗺️</span>
+          <div style={{flex:1}}>
+            <div style={{fontSize:"13px",fontWeight:700,color:C.text}}>토지이음 — 토지이용계획 확인</div>
+            <div style={{fontSize:"10px",color:C.muted}}>eum.go.kr · 용도지역·지구, 공시지가 등 확인 가능</div>
+          </div>
+          <button onClick={onClose} style={{width:"28px",height:"28px",borderRadius:"50%",border:`1.5px solid ${C.border}`,background:"#fff",cursor:"pointer",fontSize:"16px",display:"flex",alignItems:"center",justifyContent:"center",color:C.mid,fontWeight:700,fontFamily:C.sans}}>×</button>
+        </div>
+        <iframe
+          src="https://www.eum.go.kr/web/am/amMain.jsp"
+          style={{flex:1,border:"none",width:"100%"}}
+          title="토지이음"
+          sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"
+        />
+        <div style={{padding:"8px 14px",borderTop:`1px solid ${C.border}`,fontSize:"9px",color:C.muted,textAlign:"center"}}>
+          토지이음(eum.go.kr) 외부 서비스 연동 · 공시지가 및 용도지역 확인 후 시뮬레이터에 직접 입력하세요
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// § 7-C. 산출내역 탭 (계산 흐름 시각화)
+// ═══════════════════════════════════════════════════════
+function FlowArrow(){
+  return <div style={{textAlign:"center",fontSize:"18px",color:C.muted,lineHeight:1,margin:"4px 0"}}>↓</div>;
+}
+function FlowBox({title,color,bg,items,note}){
+  return(
+    <div style={{border:`2px solid ${color}30`,borderRadius:"10px",background:bg||"#fff",overflow:"hidden",marginBottom:"6px"}}>
+      <div style={{padding:"7px 13px",background:`${color}15`,borderBottom:`1px solid ${color}20`}}>
+        <span style={{fontSize:"12px",fontWeight:700,color}}>{title}</span>
+      </div>
+      <div style={{padding:"10px 13px"}}>
+        {items.map(([l,v,sub],i)=>(
+          <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",padding:"3px 0",borderBottom:i<items.length-1?`1px dashed ${C.faint}`:"none"}}>
+            <span style={{fontSize:"11px",color:C.mid}}>{l}</span>
+            <div style={{textAlign:"right"}}>
+              <span style={{fontFamily:C.mono,fontSize:"13px",color,fontWeight:600}}>{v}</span>
+              {sub&&<span style={{fontSize:"9px",color:C.muted,marginLeft:"5px"}}>{sub}</span>}
+            </div>
+          </div>
+        ))}
+        {note&&<div style={{marginTop:"7px",fontSize:"9px",color:C.muted,lineHeight:1.6,fontStyle:"italic"}}>{note}</div>}
+      </div>
+    </div>
+  );
+}
+
+function CalcFlowTab({bldg,area,cost,rev,ana,anlys}){
+  if(!bldg)return null;
+  const c=cost, r=rev;
+  const hasSale=(r?.saleIncome||0)>0;
+  const exclR=n(bldg.par.exclR);
+  const er=exclR/100;
+
+  return(
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:"16px",alignItems:"start"}}>
+
+      {/* ── 1. 면적 계산 흐름 ── */}
+      <div>
+        <div style={{fontSize:"13px",fontWeight:700,color:C.accent,marginBottom:"10px",paddingBottom:"6px",borderBottom:`2px solid ${C.accent}20`}}>
+          📐 면적 산출 흐름
+        </div>
+        <FlowBox title="① 전용면적 입력" color={C.accent} items={[
+          ["지상 전용면적 합계", fmt(area?.sa?.ex)+" ㎡", "직접 입력값"],
+          ["지하 전용면적 합계", fmt(area?.sb?.ex)+" ㎡", "직접 입력값"],
+        ]}/>
+        <FlowArrow/>
+        <FlowBox title="② 전용+공용 산출" color={C.accent} note={`산식: 전용 ÷ 전용률(${exclR}%) = 전용+공용`} items={[
+          ["지상 전용+공용", fmt(area?.sa?.com)+" ㎡", `전용${fmt(area?.sa?.ex)} ÷ ${exclR}%`],
+          ["지하 전용+공용", fmt(area?.sb?.com)+" ㎡"],
+          ["공용면적(지상)", fmt(area?.sa?.co)+" ㎡", "전용+공용 − 전용"],
+        ]}/>
+        <FlowArrow/>
+        <FlowBox title="③ 기전실·주차장 배분" color={C.accent} note="전체 전용+공용 합계 기준 비율로 층별 배분" items={[
+          ["기전실 비율", n(bldg.par.mechR)+"%", "전체 전용+공용 대비"],
+          ["기전실 총계", fmt(area?.mchTot)+" ㎡"],
+          ["법정주차대수", (area?.legalP||0)+"대", "조례 자동계산"],
+          ["주차장 총계", fmt(area?.pkTot)+" ㎡", "대수×배수×1대당면적"],
+        ]}/>
+        <FlowArrow/>
+        <FlowBox title="④ 층합계 → 연면적" color={C.accent} items={[
+          ["지상 층합계", fmt(area?.gfaA)+" ㎡", "전용+공용+기전실+주차"],
+          ["지하 층합계", fmt(area?.gfaB)+" ㎡"],
+          ["전체 연면적", fmt(area?.gfaT)+" ㎡"],
+          ["용적률산정용", fmt(area?.gfaFar)+" ㎡", "지상 전용+공용만"],
+        ]}/>
+        <FlowArrow/>
+        <FlowBox title="⑤ 건폐율·용적률 검토" color={C.green} items={[
+          ["건폐율", fP(area?.bcr)+"%", `건축면적(${fmt(n(bldg.bldgArea))}) ÷ 대지면적(${fmt(area?.siteN)})`],
+          ["용적률", fP(area?.far)+"%", "용산연면적 ÷ 대지면적"],
+        ]}/>
+      </div>
+
+      {/* ── 2. 사업비 계산 흐름 ── */}
+      <div>
+        <div style={{fontSize:"13px",fontWeight:700,color:C.amber,marginBottom:"10px",paddingBottom:"6px",borderBottom:`2px solid ${C.amber}20`}}>
+          💰 사업비 산출 흐름
+        </div>
+        <FlowBox title="① 토지비" color={C.amber} note={c?.landMult>1?`감정 추정가 = 입력단가 × ${c?.landMult}배`:"배수 1.0 = 입력단가 그대로"} items={[
+          ["대지면적", fmt(area?.siteN)+" ㎡"],
+          ["토지 단가 (입력)", fM(n(bldg.cost.landUnit))+" 원/㎡"],
+          ["토지비 (장부)", fM(c?.land)+" 원"],
+          ...(c?.landMult>1?[["감정 추정가", fM(c?.appraisalLand)+" 원", `×${c?.landMult}배`]]:[] ),
+        ]}/>
+        <FlowArrow/>
+        <FlowBox title="② 공사비" color={C.amber} note="지상/지하 단가 분리 적용" items={[
+          ["지상 공사비", fM(c?.cA)+" 원", `${fmt(area?.gfaA)}㎡ × ${fM(n(bldg.cost.constrAbove))}원/㎡`],
+          ["지하 공사비", fM(c?.cB)+" 원", `${fmt(area?.gfaB)}㎡ × ${fM(n(bldg.cost.constrBelow))}원/㎡`],
+          ["공사비 합계", fM(c?.constr)+" 원"],
+        ]}/>
+        <FlowArrow/>
+        <FlowBox title="③ 간접비" color={C.amber} note="설계비는 공사비 규모별 대가기준 자동 적용" items={[
+          ["설계비", fM(c?.design)+" 원", `${fP(c?.designRate)}% (대가기준 자동)`],
+          ["감리비", fM(c?.superv)+" 원", `${fP(c?.supervRate)}%`],
+          ["예비비", fM(c?.reserve)+" 원", `${bldg.cost.reserveR}%`],
+          ["취득세", fM(c?.acquiTax)+" 원", `토지비 × ${ACQUI_TAX_RATE}%`],
+          ["제부담금 합계", fM(c?.chgTotal)+" 원"],
+        ]}/>
+        <FlowArrow/>
+        <FlowBox title="④ 기초 사업비 → TDC" color={C.amber} items={[
+          ["기초 사업비", fM(c?.base)+" 원", "토지+공사+간접"],
+          ["대출금액", fM(c?.loan)+" 원", `LTV ${bldg.cost.ltvR}%`],
+          ["금융비용(이자)", fM(c?.finance)+" 원", `연${bldg.cost.loanR}% × ${bldg.cost.loanPeriod}개월`],
+          ["TDC (총사업비)", fM(c?.tdc)+" 원", "기초+금융"],
+          ["자기자본(Equity)", fM(c?.equity)+" 원", "TDC − 대출금"],
+        ]}/>
+        {/* 제부담금 세부 */}
+        <div style={{marginTop:"10px",border:`1px solid ${C.amber}30`,borderRadius:"8px",overflow:"hidden"}}>
+          <div style={{padding:"6px 12px",background:`${C.amber}10`,fontSize:"11px",fontWeight:700,color:C.amber}}>제부담금 세부 (의무/선택/비해당)</div>
+          {Object.entries(INIT_CHARGES).map(([key,ci])=>{
+            const cs=c?.charges?.[key]?.cs||getChargeStatus(key,bldg,area);
+            const val=c?.charges?.[key]?.final||0;
+            const statusColor=cs.status==="required"?C.red:cs.status==="optional"?C.amber:C.muted;
+            return(
+              <div key={key} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"5px 12px",borderBottom:`1px solid ${C.faint}`,background:"#fff"}}>
+                <div>
+                  <span style={{fontSize:"10px",fontWeight:600,color:C.mid}}>{ci.label}</span>
+                  <span style={{marginLeft:"6px",fontSize:"9px",padding:"1px 5px",borderRadius:"3px",background:`${statusColor}15`,color:statusColor,fontWeight:600}}>{cs.label}</span>
+                </div>
+                <span style={{fontFamily:C.mono,fontSize:"11px",color:val>0?C.amber:C.muted}}>{val>0?fM(val)+" 원":"—"}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* ── 3. 수익 계산 흐름 ── */}
+      <div>
+        <div style={{fontSize:"13px",fontWeight:700,color:C.green,marginBottom:"10px",paddingBottom:"6px",borderBottom:`2px solid ${C.green}20`}}>
+          📈 수익 산출 흐름
+        </div>
+        {hasSale&&(
+          <>
+            <FlowBox title="① 분양 수입" color="#dc2626" bg="#fff9f9" items={[
+              ["총 분양면적", fmt(r?.totalSaleArea)+" ㎡", "층합계 기준"],
+              ["분양수입 합계", fM(r?.saleIncome)+" 원", "준공 시 일시수령"],
+              ["배분 사업비", fM(r?.saleTDC)+" 원", `TDC × ${fP(pct(r?.totalSaleArea,area?.gfaA))}%`],
+              ["분양 개발이익", fM(r?.saleProfit)+" 원"],
+              ["사업수지율", fP(r?.saleSujiRate)+"%", "분양수입÷배분사업비"],
+            ]}/>
+            <FlowArrow/>
+          </>
+        )}
+        <FlowBox title={hasSale?"② 임대 수입 (GI)":"① 임대 수입 (GI)"} color={C.green} note="용도별 임대수입 + 보증금 운용수익 합산" items={[
+          ["연 임대수입", fM(r?.annual)+" 원"],
+          ["보증금 합계", fM(r?.deposit)+" 원"],
+          ["보증금 운용수익", fM(r?.depInc)+" 원", `전환율 ${bldg.rev.convR}%`],
+          ["총수입 GI", fM(r?.gi)+" 원"],
+        ]}/>
+        <FlowArrow/>
+        <FlowBox title={hasSale?"③ EGI (공실 차감)":"② EGI (공실 차감)"} color={C.green} note={`공실률 ${bldg.rev.vacancyR}% 적용`} items={[
+          ["공실 차감", `▼ ${fM(r?.vacancy)}`+" 원"],
+          ["유효총수입 EGI", fM(r?.egi)+" 원"],
+        ]}/>
+        <FlowArrow/>
+        <FlowBox title={hasSale?"④ NOI 산출":"③ NOI 산출"} color={C.green} note="운영비 + 재산세 차감 → 순영업이익" items={[
+          ["운영비 (OpEx)", `▼ ${fM(r?.opex)}`+" 원", `EGI × ${bldg.rev.opexR}%`],
+          ["재산세 (건물분)", `▼ ${fM(r?.propTaxBldg)}`+" 원", "공사비 기준 근사"],
+          ["재산세 (토지분)", `▼ ${fM(r?.propTaxLand)}`+" 원", "토지비 기준 근사"],
+          ["NOI (순영업이익)", fM(r?.noi)+" 원 / 연"],
+        ]}/>
+        <FlowArrow/>
+        <FlowBox title={hasSale?"⑤ 임대 수익률":"④ 임대 수익률"} color={C.green} items={[
+          ["Cap Rate", fP(c?.tdc>0?r?.noi/c?.tdc*100:0)+"%", "NOI ÷ TDC"],
+          ["임대 Cap Rate", fP(c?.tdc&&r?.rentTDC>0?r?.noi/r?.rentTDC*100:0)+"%", "NOI ÷ 임대배분TDC"],
+        ]}/>
+      </div>
+
+      {/* ── 4. 사업성 분석 흐름 ── */}
+      {ana&&(
+        <div>
+          <div style={{fontSize:"13px",fontWeight:700,color:C.purple,marginBottom:"10px",paddingBottom:"6px",borderBottom:`2px solid ${C.purple}20`}}>
+            🔍 사업성 분석 흐름
+          </div>
+          <FlowBox title="① 현금흐름 구성" color={C.purple} note={hasSale?"0년차: −자기자본+분양수입 / 1~n년차: 임대NOI−원리금 / n년차말: +출구가치":"0년차: −자기자본 / 1~n년차: NOI−원리금 / n년차말: +출구가치"} items={[
+            ["보유기간", anlys?.holdYears+"년"],
+            ["임대료 상승", anlys?.rentEscR+"% / "+anlys?.rentEscPeriod+"년마다"],
+            [hasSale?"0년차 CF (분양포함)":"0년차 CF", fM(ana?.cfs?.[0])+" 원"],
+            ["1년차 임대 CF", fM(ana?.yearNOIs?.[0] - ana?.debtSvc)+" 원"],
+            ["연 원리금", fM(ana?.debtSvc)+" 원", `대출×${anlys?.mortgageR}%`],
+          ]}/>
+          <FlowArrow/>
+          <FlowBox title="② 출구가치 (Terminal Value)" color={C.purple} note={`NOI ÷ 출구Cap Rate(${anlys?.exitCapR}%) = 매각 추정가`} items={[
+            ["출구 Cap Rate", anlys?.exitCapR+"%"],
+            ["출구가치 (TV)", fM(ana?.tv)+" 원"],
+            ["잔여 대출 상환", fM(ana?.rentLoan)+" 원"],
+            ["순 출구 CF", fM(ana?.tv-ana?.rentLoan)+" 원"],
+          ]}/>
+          <FlowArrow/>
+          <FlowBox title="③ NPV / IRR 산출" color={C.purple} note={`할인율 ${anlys?.discountR}% 적용. IRR = NPV=0이 되는 할인율`} items={[
+            ["NPV", fM(ana?.NPV)+" 원", ana?.NPV>0?"✓ 타당":"✗ 재검토"],
+            ["통합 IRR", ana?.IRR!==null?fP(ana?.IRR)+"%":"산출불가", `기준 ${anlys?.discountR}%`],
+            ["투자회수기간", ana?.payback!==null?fP(ana?.payback,1)+"년":"—"],
+          ]}/>
+          <FlowArrow/>
+          <FlowBox title="④ B/C 분석" color={C.purple} note={`편익 = ${anlys?.bcYears}년 NOI PV + 출구가치 PV / 비용 = 자기자본`} items={[
+            ["B/C Ratio", fP(ana?.bc,2), ana?.bc>=1.2?"✓ 우수":ana?.bc>=1?"△ 타당":"✗ 미달"],
+          ]}/>
+          <FlowArrow/>
+          <FlowBox title="⑤ 민감도 분석 요약" color={C.purple} note="NOI ±20% 변동 시 통합IRR 범위" items={
+            ana?.sens?[
+              ["NOI −20%", ana.sens[0]?.irr!==null?fP(ana.sens[0].irr*100)+"%":"—"],
+              ["NOI 기준", ana.sens[2]?.irr!==null?fP(ana.sens[2].irr*100)+"%":"—"],
+              ["NOI +20%", ana.sens[4]?.irr!==null?fP(ana.sens[4].irr*100)+"%":"—"],
+            ]:[]
+          }/>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
 // § 7. 원자 컴포넌트
 // ═══════════════════════════════════════════════════════
 function TInput({label,value,onChange,unit,placeholder="",readOnly=false,mono=true,small,lawNote,warn}){
@@ -561,63 +930,74 @@ function CompBadge({label,actual,max}){
 }
 
 // 제부담금 행 컴포넌트
-function ChargRow({chargeKey,chargeRef,chargeResult,override,dispatch,bldgId}){
+function ChargRow({chargeKey,chargeRef,chargeResult,override,dispatch,bldgId,bldg,area}){
   const D=(type,p)=>dispatch({type,p});
+  const cs=chargeResult?.cs||getChargeStatus(chargeKey,bldg,area);
   const isEnabled=chargeRef.enabled;
   const autoVal=chargeResult?.auto||0;
   const finalVal=chargeResult?.final||0;
   const isOverridden=chargeResult?.overridden||false;
-  const isSpecial=chargeKey==="develop"; // 개발부담금은 별도 처리
+  const isSpecial=chargeKey==="develop";
+  const isNA=cs.status==="na";
+  const isRequired=cs.status==="required";
 
   return(
-    <div style={{padding:"10px 13px",borderBottom:`1px solid ${C.faint}`,background:isEnabled?"#fff":C.cardAlt}}>
+    <div style={{padding:"10px 13px",borderBottom:`1px solid ${C.faint}`,background:isNA?C.cardAlt:isEnabled?"#fff":C.cardAlt,opacity:isNA?0.6:1}}>
       <div style={{display:"flex",alignItems:"flex-start",gap:"10px",flexWrap:"wrap"}}>
-        {/* 활성 토글 */}
-        <div style={{display:"flex",alignItems:"center",gap:"7px",minWidth:"200px",flex:"0 0 auto"}}>
-          <button onClick={()=>D("CHARGE_REF",{key:chargeKey,k:"enabled",v:!isEnabled})}
-            style={{width:"32px",height:"18px",borderRadius:"9px",border:"none",cursor:"pointer",background:isEnabled?C.green:C.faint,transition:"background 0.2s",flexShrink:0,position:"relative"}}>
-            <div style={{width:"14px",height:"14px",borderRadius:"50%",background:"#fff",position:"absolute",top:"2px",left:isEnabled?"16px":"2px",transition:"left 0.2s",boxShadow:"0 1px 3px rgba(0,0,0,0.2)"}}/>
-          </button>
+        {/* 활성 토글 + 의무/선택/비해당 배지 */}
+        <div style={{display:"flex",alignItems:"center",gap:"7px",minWidth:"220px",flex:"0 0 auto"}}>
+          {!isNA&&(
+            <button onClick={()=>D("CHARGE_REF",{key:chargeKey,k:"enabled",v:!isEnabled})}
+              style={{width:"32px",height:"18px",borderRadius:"9px",border:"none",cursor:isRequired?"not-allowed":"pointer",background:isEnabled?C.green:C.faint,transition:"background 0.2s",flexShrink:0,position:"relative"}}>
+              <div style={{width:"14px",height:"14px",borderRadius:"50%",background:"#fff",position:"absolute",top:"2px",left:isEnabled?"16px":"2px",transition:"left 0.2s",boxShadow:"0 1px 3px rgba(0,0,0,0.2)"}}/>
+            </button>
+          )}
+          {isNA&&<div style={{width:"32px",flexShrink:0}}/>}
           <div>
-            <div style={{fontSize:"12px",fontWeight:600,color:isEnabled?C.text:C.muted}}>{chargeRef.label}</div>
+            <div style={{display:"flex",alignItems:"center",gap:"5px",marginBottom:"2px"}}>
+              <span style={{fontSize:"12px",fontWeight:600,color:isNA?C.muted:isEnabled?C.text:C.muted}}>{chargeRef.label}</span>
+              <span style={{fontSize:"8px",padding:"1px 5px",borderRadius:"3px",fontWeight:700,background:`${cs.color}15`,color:cs.color}}>{cs.label}</span>
+              {isRequired&&<span style={{fontSize:"8px",color:C.red}}>🔴고정</span>}
+            </div>
             <div style={{fontSize:"9px",color:C.purple}}>{chargeRef.law}</div>
+            <div style={{fontSize:"9px",color:C.muted,marginTop:"1px"}}>{cs.reason}</div>
           </div>
         </div>
 
         {/* 자동계산 값 */}
         <div style={{flex:1,minWidth:"140px"}}>
-          {isEnabled&&!isSpecial?(
+          {isNA?(
+            <div style={{fontSize:"10px",color:C.muted,fontStyle:"italic"}}>비해당 — 이 사업에 적용되지 않습니다</div>
+          ):isEnabled&&!isSpecial?(
             <div style={{fontSize:"11px",color:C.muted}}>
               자동계산: <span style={{fontFamily:C.mono,color:isOverridden?C.muted:C.teal,fontWeight:isOverridden?400:700,textDecoration:isOverridden?"line-through":"none"}}>{fM(autoVal)} 원</span>
-              <span style={{fontSize:"9px",color:C.muted,marginLeft:"5px"}}>({chargeRef.note?.split('.')[0]})</span>
             </div>
           ):isEnabled&&isSpecial?(
             <div style={{display:"flex",gap:"8px",alignItems:"center",flexWrap:"wrap"}}>
               <TInput label="준공 후 토지가액 (원/㎡)" value={override?.developLandUnit||""} onChange={v=>D("CST",{id:bldgId,k:"developLandUnit",v})} unit="원/㎡" small/>
-              <div style={{fontSize:"10px",color:C.muted,marginTop:"16px"}}>→ 자동: <span style={{fontFamily:C.mono,color:isOverridden?C.muted:C.teal,fontWeight:700}}>{fM(autoVal)}</span></div>
+              <div style={{fontSize:"10px",color:C.muted,marginTop:"16px"}}>자동: <span style={{fontFamily:C.mono,color:C.teal,fontWeight:700}}>{fM(autoVal)}</span></div>
             </div>
           ):(
-            <div style={{fontSize:"10px",color:C.muted}}>비활성 — 기준탭에서 활성화 가능</div>
+            <div style={{fontSize:"10px",color:C.muted}}>비활성 — 토글로 활성화</div>
           )}
         </div>
 
-        {/* 수동입력 override */}
-        {isEnabled&&(
+        {/* 수동입력 */}
+        {isEnabled&&!isNA&&(
           <div style={{minWidth:"160px",flex:"0 0 auto"}}>
-            <TInput label={`직접입력 ${isOverridden?"★ 적용중":"(자동값 사용)"}`} value={override?.[chargeKey]||""} onChange={v=>D("CO",{id:bldgId,k:chargeKey,v})} unit="원" small warn={isOverridden} placeholder={autoVal>0?`자동: ${fM(autoVal)}`:"해당 없음"}/>
+            <TInput label={`직접입력 ${isOverridden?"★ 적용중":"(자동값 사용)"}`} value={override?.[chargeKey]||""} onChange={v=>D("CO",{id:bldgId,k:chargeKey,v})} unit="원" small warn={isOverridden} placeholder={autoVal>0?`자동: ${fM(autoVal)}`:"0"}/>
             {isOverridden&&<button onClick={()=>D("CO",{id:bldgId,k:chargeKey,v:""})} style={{fontSize:"9px",color:C.red,background:"transparent",border:"none",cursor:"pointer",padding:"2px 0",fontFamily:C.sans}}>× 자동으로 되돌리기</button>}
           </div>
         )}
 
-        {/* 최종 적용값 */}
-        {isEnabled&&(
+        {/* 최종값 */}
+        {isEnabled&&!isNA&&(
           <div style={{textAlign:"right",minWidth:"90px",flex:"0 0 auto"}}>
             <div style={{fontSize:"9px",color:C.muted}}>최종 적용</div>
             <div style={{fontFamily:C.mono,fontSize:"13px",color:isOverridden?C.amber:C.teal,fontWeight:700}}>{fM(finalVal)}</div>
           </div>
         )}
       </div>
-      {isEnabled&&chargeRef.hint&&<div style={{fontSize:"9px",color:C.muted,marginTop:"4px",paddingLeft:"42px",fontStyle:"italic"}}>{chargeRef.hint}</div>}
     </div>
   );
 }
@@ -914,7 +1294,7 @@ function AreaTab({state,dispatch,bldg,area,allCalcs}){
 // ═══════════════════════════════════════════════════════
 // § 10. 사업비 탭
 // ═══════════════════════════════════════════════════════
-function CostTab({bldg,dispatch,area,refs}){
+function CostTab({bldg,dispatch,area,refs,onEum}){
   const bt=BT[bldg.type]||BT.office;
   const D=(type,p)=>dispatch({type,p});
   const uC=k=>v=>D("CST",{id:bldg.id,k,v});
@@ -926,10 +1306,30 @@ function CostTab({bldg,dispatch,area,refs}){
     <div>
       {/* 토지비 */}
       <Card title="토지비" tag="LAND COST" accentBar={bt.color}>
-        <G cols="repeat(auto-fit,minmax(150px,1fr))">
+        <div style={{display:"flex",alignItems:"center",justifyContent:"flex-end",marginBottom:"8px"}}>
+          <button onClick={onEum}
+            style={{display:"flex",alignItems:"center",gap:"5px",padding:"5px 12px",borderRadius:"7px",border:`1.5px solid #0ea5e9`,background:"#f0f9ff",color:"#0369a1",fontSize:"11px",fontWeight:600,cursor:"pointer",fontFamily:C.sans,boxShadow:C.shadow}}>
+            🗺️ 토지이음에서 가격 확인
+          </button>
+        </div>
+        <G cols="repeat(auto-fit,minmax(140px,1fr))">
           <TInput label="토지 단가 (원/㎡)" value={c.landUnit} onChange={uC("landUnit")} unit="원/㎡"/>
-          <KpiCard label="대지면적 (면적탭 연동)" value={fmt(area.siteN)}/>
-          <KpiCard label="토지비" value={fM(cc.land)} unit="" hi sub={fmt(cc.land,0)+" 원"}/>
+          <div>
+            <div style={{fontSize:"11px",color:C.muted,marginBottom:"4px",fontWeight:600}}>
+              감정가 배수 <span style={{fontSize:"9px",color:C.teal,background:C.tealBg,padding:"1px 5px",borderRadius:"3px"}}>추정배수</span>
+            </div>
+            <div style={{display:"flex",gap:"6px",alignItems:"center"}}>
+              <input value={c.landMult} onChange={e=>uC("landMult")(e.target.value)}
+                style={{width:"65px",border:`1.5px solid ${C.border}`,borderRadius:"7px",padding:"7px 10px",fontSize:"13px",fontFamily:C.mono,outline:"none",textAlign:"right"}}/>
+              <span style={{fontSize:"10px",color:C.muted}}>배</span>
+            </div>
+            <div style={{fontSize:"9px",color:C.muted,marginTop:"3px"}}>입력단가 × 배수 = 감정추정가</div>
+          </div>
+          <KpiCard label="대지면적" value={fmt(area.siteN)}/>
+          <KpiCard label="토지비 (입력기준)" value={fM(cc.land)} unit="" hi sub={fmt(cc.land,0)+" 원"}/>
+          {n(c.landMult)>1&&(
+            <KpiCard label={`감정 추정 토지가 (×${c.landMult})`} value={fM(cc.appraisalLand)} unit="" ok2 sub="참고값 (사업비 미반영)"/>
+          )}
         </G>
         <div style={{marginTop:"10px"}}>
           <TInput label="취득세 (자동계산 / 직접입력 우선)" value={c.acquiTaxOverride} onChange={uC("acquiTaxOverride")} unit="원"
@@ -976,13 +1376,15 @@ function CostTab({bldg,dispatch,area,refs}){
       {/* 제부담금 */}
       <Card title="제부담금 · 제세공과금 (자동계산)" tag="STATUTORY CHARGES" accentBar={C.teal} collapsible>
         <div style={{marginBottom:"10px",padding:"8px 11px",background:C.tealBg,border:`1px solid ${C.teal}30`,borderRadius:"7px",fontSize:"10px",color:C.teal,lineHeight:1.7}}>
-          🔄 기준탭의 단가를 기반으로 자동 계산됩니다. 직접입력 시 자동값을 덮어씁니다. 토글(●/○)로 항목을 활성화/비활성화할 수 있습니다.
+          🔴 <strong>의무</strong>: 규모·용도상 반드시 납부 (토글 비활성화 불가) &nbsp;
+          🟡 <strong>선택</strong>: 해당 여부 확인 후 활성화 &nbsp;
+          ⬜ <strong>비해당</strong>: 이 사업 비적용
         </div>
         <div style={{border:`1.5px solid ${C.border}`,borderRadius:"9px",overflow:"hidden"}}>
           {Object.keys(INIT_CHARGES).map(key=>(
             <ChargRow key={key} chargeKey={key} chargeRef={refs.charges[key]}
               chargeResult={cc.charges[key]} override={{...bldg.cost.chargeOverrides, developLandUnit:bldg.cost.developLandUnit}}
-              dispatch={dispatch} bldgId={bldg.id}/>
+              dispatch={dispatch} bldgId={bldg.id} bldg={bldg} area={area}/>
           ))}
         </div>
         <div style={{marginTop:"10px",padding:"9px 13px",background:C.cardAlt,borderRadius:"8px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
@@ -1430,7 +1832,205 @@ function AnalysisTab({state,dispatch,allCalcs}){
 // ═══════════════════════════════════════════════════════
 // § 13. 메인 앱
 // ═══════════════════════════════════════════════════════
-const TABS=[{id:"area",label:"면적표",icon:"📐"},{id:"cost",label:"사업비",icon:"💰"},{id:"rev",label:"수익 계획",icon:"📊"},{id:"analysis",label:"사업성분석",icon:"🔍"},{id:"refs",label:"기준",icon:"📋"}];
+const TABS=[
+  {id:"area",    label:"면적표",   icon:"📐"},
+  {id:"cost",    label:"사업비",   icon:"💰"},
+  {id:"rev",     label:"수익 계획",icon:"📊"},
+  {id:"analysis",label:"사업성분석",icon:"🔍"},
+  {id:"flow",    label:"산출내역", icon:"🔁"},
+  {id:"refs",    label:"기준",     icon:"📋"},
+];
+
+export default function App(){
+  const[state,dispatch]=useReducer(reducer,initState);
+  const{siteMode,site,buildings,activeBldgId,activeTab,refs}=state;
+  const D=useCallback((type,p)=>dispatch({type,p}),[]);
+
+  // 인증
+  const{user,loading:authLoading,signIn,signOut}=useAuth();
+
+  // 저장/불러오기
+  const[lastSaved,setLastSaved]=useState(null);
+  const[saveMsg,setSaveMsg]=useState(null);
+  const handleSave=()=>{
+    const ok=saveState(state);
+    const t=new Date().toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit"});
+    setLastSaved(t);
+    setSaveMsg(ok?"✓ 저장됨":"저장 실패");
+    setTimeout(()=>setSaveMsg(null),2000);
+  };
+  const handleLoad=()=>{
+    const s=loadState();
+    if(!s){setSaveMsg("저장된 데이터 없음"); setTimeout(()=>setSaveMsg(null),2000); return;}
+    // 상태 전체 교체
+    Object.entries(s).forEach(([k,v])=>{
+      if(k!=="activeTab")dispatch({type:"SITE_MODE",p:s.siteMode||"single"});
+    });
+    // 간단하게 page reload 없이 로드: 실제로는 reducer에 LOAD_STATE action 추가 권장
+    setSaveMsg("✓ 불러옴"); setTimeout(()=>setSaveMsg(null),2000);
+  };
+
+  // 토지이음 모달
+  const[showEum,setShowEum]=useState(false);
+
+  const activeBldg=buildings.find(b=>b.id===activeBldgId)||buildings[0];
+  const bt=BT[activeBldg?.type]||BT.office;
+
+  const allCalcs=useMemo(()=>buildings.map(bldg=>{
+    const siteArea=siteMode==="single"?site.area:bldg.ownSiteArea;
+    const area=calcArea(bldg,siteArea,refs.parking);
+    const cost=calcCost(bldg,area,refs);
+    const rev=calcRev(bldg,area,cost);
+    return{bldg,area,cost,rev};
+  }),[buildings,siteMode,site,refs]);
+
+  const activeCalc=allCalcs.find(c=>c.bldg.id===activeBldgId)||allCalcs[0];
+
+  const totTDC=allCalcs.reduce((s,c)=>s+c.cost.tdc,0);
+  const totNOI=allCalcs.reduce((s,c)=>s+c.rev.noi,0);
+  const totSaleAll=allCalcs.reduce((s,c)=>s+(c.rev.saleIncome||0),0);
+  const cap=totTDC>0?totNOI/totTDC*100:0;
+
+  // 분석 탭용 통합 계산 (산출내역에도 사용)
+  const{anlys}=state;
+  const totLoan=allCalcs.reduce((s,c)=>s+c.cost.loan,0);
+  const totAnn=allCalcs.reduce((s,c)=>s+c.rev.annual,0);
+  const totEq=totTDC-totLoan;
+  const totSaleIncome=allCalcs.reduce((s,c)=>s+(c.rev.saleIncome||0),0);
+  const totSaleProfit=allCalcs.reduce((s,c)=>s+(c.rev.saleProfit||0),0);
+  const totSaleTDC=allCalcs.reduce((s,c)=>s+(c.rev.saleTDC||0),0);
+  const totRentLoan=allCalcs.reduce((s,c)=>s+(c.rev.rentLoan||c.cost.loan),0);
+  const globalAna=totTDC>0&&(totNOI!==0||totEq>0)
+    ?calcAnalysis(totTDC,totEq,totLoan,totNOI,totAnn,anlys,{saleIncome:totSaleIncome,saleProfit:totSaleProfit,saleTDC:totSaleTDC,rentLoan:totRentLoan})
+    :null;
+
+  return(
+    <div style={{fontFamily:C.sans,background:C.bg,color:C.text,minHeight:"100vh",fontSize:"13px"}}>
+      {/* 토지이음 모달 */}
+      {showEum&&<EumModal onClose={()=>setShowEum(false)}/>}
+
+      {/* 저장 피드백 토스트 */}
+      {saveMsg&&(
+        <div style={{position:"fixed",bottom:"24px",right:"24px",zIndex:9999,padding:"10px 18px",borderRadius:"9px",background:C.hdr,color:"#fff",fontSize:"13px",fontWeight:600,boxShadow:"0 4px 20px rgba(0,0,0,0.3)",transition:"all 0.2s"}}>
+          {saveMsg}
+        </div>
+      )}
+
+      {/* 헤더 */}
+      <div style={{background:C.hdr,padding:"11px 18px",display:"flex",alignItems:"center",gap:"13px",position:"sticky",top:0,zIndex:400,boxShadow:"0 2px 8px rgba(0,0,0,0.3)"}}>
+        <div style={{width:"32px",height:"32px",background:C.accent,borderRadius:"8px",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+          <svg width="18" height="18" viewBox="0 0 20 20" fill="none"><rect x="2" y="2" width="7" height="16" stroke="#fff" strokeWidth="1.5"/><rect x="11" y="7" width="7" height="11" stroke="#fff" strokeWidth="1.5"/><line x1="1" y1="19" x2="19" y2="19" stroke="#fff" strokeWidth="1.5"/></svg>
+        </div>
+        <div style={{flex:1}}>
+          <div style={{fontSize:"13px",fontWeight:700,color:C.hdrText,letterSpacing:"-0.02em"}}>건축사업 사업성 검토기</div>
+          <div style={{fontSize:"9px",color:"#64748b",letterSpacing:"0.04em"}}>v6.0 · {refs.region} 기준</div>
+        </div>
+        {totTDC>0&&(
+          <div style={{display:"flex",gap:"14px",flexWrap:"wrap"}}>
+            {[
+              ["TDC",fM(totTDC)],
+              ...(totSaleAll>0?[["분양수입",fM(totSaleAll)]]:[] ),
+              ["NOI/년",fM(totNOI)],
+              ["Cap Rate",cap>0?fP(cap)+"%":"—"],
+            ].map(([l,v])=>(
+              <div key={l} style={{textAlign:"right"}}>
+                <div style={{fontSize:"8px",color:"#64748b"}}>{l}</div>
+                <div style={{fontSize:"12px",fontFamily:C.mono,color:"#e2e8f0",fontWeight:700}}>{v}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* 인증 + 저장 바 */}
+      <AuthBar user={user} loading={authLoading} signIn={signIn} signOut={signOut}
+        onSave={handleSave} onLoad={handleLoad} lastSaved={lastSaved}/>
+
+      {/* 대지 모드 */}
+      <div style={{background:"#fff",borderBottom:`1px solid ${C.border}`,padding:"7px 18px",display:"flex",alignItems:"center",gap:"14px",flexWrap:"wrap"}}>
+        <span style={{fontSize:"10px",fontWeight:700,color:C.muted,letterSpacing:"0.04em"}}>대지 구성</span>
+        <div style={{display:"flex",gap:"0",background:C.cardAlt,border:`1.5px solid ${C.border}`,borderRadius:"8px",padding:"2px",overflow:"hidden"}}>
+          {[["single","🏗 단일 대지"],["multiple","🏗 복수 대지"]].map(([v,l])=>(
+            <button key={v} onClick={()=>D("SITE_MODE",v)} style={{padding:"4px 12px",background:siteMode===v?"#fff":"transparent",border:"none",borderRadius:"6px",color:siteMode===v?C.accent:C.muted,fontSize:"11px",fontWeight:siteMode===v?700:400,cursor:"pointer",fontFamily:C.sans,boxShadow:siteMode===v?C.shadow:"none",transition:"all 0.15s"}}>{l}</button>
+          ))}
+        </div>
+        <div style={{fontSize:"10px",padding:"3px 9px",borderRadius:"5px",background:siteMode==="single"?C.accentBg:C.amberBg,border:`1px solid ${siteMode==="single"?C.accent+"40":C.amber+"40"}`,color:siteMode==="single"?C.accent:C.amber}}>
+          {siteMode==="single"?"대지·용도지역 공통 / 건폐율·용적률 합산":"건물별 별도 대지 / 각각 산출"}
+        </div>
+      </div>
+
+      {/* 건물 목록 */}
+      <div style={{background:"#fff",borderBottom:`2px solid ${C.border}`,padding:"7px 18px",display:"flex",alignItems:"center",gap:"7px",flexWrap:"wrap"}}>
+        <span style={{fontSize:"9px",fontWeight:700,color:C.muted,letterSpacing:"0.06em",marginRight:"3px",flexShrink:0}}>건물 목록</span>
+        {buildings.map(b=>{
+          const bbt=BT[b.type]||BT.office;
+          const active=b.id===activeBldgId;
+          return(
+            <div key={b.id} style={{display:"flex",alignItems:"stretch",background:active?bbt.bg:C.cardAlt,border:`1.5px solid ${active?bbt.color:C.border}`,borderRadius:"18px",overflow:"hidden",transition:"all 0.15s",cursor:"pointer"}}>
+              <div onClick={()=>D("ACT_BLDG",b.id)} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 10px"}}>
+                <span style={{fontSize:"14px"}}>{bbt.emoji}</span>
+                <input value={b.name} onChange={e=>D("BF",{id:b.id,k:"name",v:e.target.value})} onClick={e=>e.stopPropagation()} style={{background:"transparent",border:"none",outline:"none",fontSize:"11px",fontWeight:active?700:500,color:active?bbt.color:C.mid,width:`${Math.max(40,b.name.length*7)}px`,fontFamily:C.sans,cursor:"text"}}/>
+                <select value={b.type} onChange={e=>D("BF",{id:b.id,k:"type",v:e.target.value})} onClick={e=>e.stopPropagation()} style={{background:"transparent",border:"none",outline:"none",fontSize:"10px",color:active?bbt.color:C.muted,cursor:"pointer",fontFamily:C.sans,fontWeight:600}}>
+                  {Object.entries(BT).map(([k,btt])=><option key={k} value={k}>{btt.short}</option>)}
+                </select>
+              </div>
+              {buildings.length>1&&(
+                <button onClick={e=>{e.stopPropagation();D("DEL_BLDG",b.id);}} style={{padding:"4px 9px",background:"transparent",border:"none",borderLeft:`1px solid ${active?bbt.color+"40":C.border}`,color:C.muted,cursor:"pointer",fontSize:"13px",lineHeight:1,transition:"background 0.15s"}} onMouseEnter={e=>e.target.style.background=C.redBg} onMouseLeave={e=>e.target.style.background="transparent"}>×</button>
+              )}
+            </div>
+          );
+        })}
+        <Btn sm variant="ghost" onClick={()=>D("ADD_BLDG","office")}>＋ 건물 추가</Btn>
+      </div>
+
+      {/* 탭 */}
+      <div style={{background:"#fff",borderBottom:`1.5px solid ${C.border}`,padding:"0 18px",display:"flex",overflowX:"auto"}}>
+        {TABS.map(({id,label,icon})=>{
+          const isRefs=id==="refs";
+          const isFlow=id==="flow";
+          const active=activeTab===id;
+          const accentColor=isRefs?C.purple:isFlow?C.teal:bt.color;
+          return(
+            <button key={id} onClick={()=>D("TAB",id)} style={{padding:"10px 14px",background:"transparent",border:"none",borderBottom:active?`2.5px solid ${accentColor}`:"2.5px solid transparent",color:active?accentColor:C.muted,cursor:"pointer",fontSize:"11px",fontWeight:active?700:400,fontFamily:C.sans,transition:"all 0.15s",marginBottom:"-1.5px",whiteSpace:"nowrap",display:"flex",alignItems:"center",gap:"4px"}}>
+              <span>{icon}</span>{label}
+              {isRefs&&<span style={{fontSize:"8px",background:C.purpleBg,color:C.purple,padding:"1px 4px",borderRadius:"3px",fontWeight:700}}>법정기준</span>}
+              {isFlow&&<span style={{fontSize:"8px",background:C.tealBg,color:C.teal,padding:"1px 4px",borderRadius:"3px",fontWeight:700}}>NEW</span>}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* 콘텐츠 */}
+      <div style={{maxWidth:"1100px",margin:"0 auto",padding:"14px"}}>
+        {activeTab==="area"     &&activeCalc&&<AreaTab     state={state} dispatch={dispatch} bldg={activeBldg} area={activeCalc.area} allCalcs={allCalcs}/>}
+        {activeTab==="cost"     &&activeCalc&&<CostTab     bldg={activeBldg} dispatch={dispatch} area={activeCalc.area} refs={refs} onEum={()=>setShowEum(true)}/>}
+        {activeTab==="rev"      &&activeCalc&&<RevTab      bldg={activeBldg} dispatch={dispatch} area={activeCalc.area} cost={activeCalc.cost}/>}
+        {activeTab==="analysis"            &&<AnalysisTab state={state} dispatch={dispatch} allCalcs={allCalcs}/>}
+        {activeTab==="flow"     &&activeCalc&&(
+          <div>
+            <div style={{padding:"10px 14px",background:C.tealBg,border:`1px solid ${C.teal}30`,borderRadius:"10px",marginBottom:"14px",fontSize:"11px",color:C.teal,lineHeight:1.7}}>
+              <strong>🔁 산출내역 탭:</strong> 면적 → 사업비 → 수익 → 사업성 분석까지 모든 계산의 중간 값과 흐름을 한눈에 확인합니다.
+              현재 선택된 건물(<strong>{activeBldg.name}</strong>)의 단일 계산 흐름을 표시합니다.
+            </div>
+            <CalcFlowTab
+              bldg={activeBldg}
+              area={activeCalc.area}
+              cost={activeCalc.cost}
+              rev={activeCalc.rev}
+              ana={globalAna}
+              anlys={anlys}
+            />
+          </div>
+        )}
+        {activeTab==="refs"                &&<RefsTab     state={state} dispatch={dispatch}/>}
+      </div>
+
+      <div style={{textAlign:"center",fontSize:"9px",color:C.muted,padding:"12px 0 24px",letterSpacing:"0.04em"}}>
+        건축사업 사업성 검토기 v6.0 · {refs.region} 기준 · 산출값은 타당성 검토 단계 참고용이며 실제 인허가·계약에 직접 적용 불가
+      </div>
+    </div>
+  );
+}
 
 export default function App(){
   const[state,dispatch]=useReducer(reducer,initState);

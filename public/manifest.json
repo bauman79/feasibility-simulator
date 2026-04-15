@@ -1,0 +1,33 @@
+{
+  "name": "건축사업 사업성 검토기",
+  "short_name": "사업성검토기",
+  "description": "건축개발사업 타당성 분석 시뮬레이터 — 면적·사업비·임대·분양·DCF 통합",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f1f5f9",
+  "theme_color": "#0f172a",
+  "orientation": "portrait-primary",
+  "lang": "ko",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["business", "productivity"],
+  "shortcuts": [
+    {
+      "name": "새 프로젝트",
+      "url": "/",
+      "description": "새 사업성 검토 시작"
+    }
+  ]
+}
