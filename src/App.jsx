@@ -2824,9 +2824,9 @@ function AptRevenueTab({apt,dispatch,area,rev}){
             <div style={{fontSize:"10px",color:C.muted,marginTop:"4px"}}>= {fM(rev.balanceAmt*1000)}원 (준공시)</div>
           </div>
         </G>
-        {(+(r.contractR)++(r.midR)++(r.balanceR))!==100&&(
+        {(Number(r.contractR)+Number(r.midR)+Number(r.balanceR))!==100&&(
           <div style={{marginTop:"8px",padding:"6px 10px",background:C.redBg,borderRadius:"6px",fontSize:"10px",color:C.red}}>
-            ⚠ 합계 = {+(r.contractR)++(r.midR)++(r.balanceR)}% — 100%가 되도록 조정해 주세요.
+            ⚠ 합계 = {Number(r.contractR)+Number(r.midR)+Number(r.balanceR)}% — 100%가 되도록 조정해 주세요.
           </div>
         )}
       </Card>
