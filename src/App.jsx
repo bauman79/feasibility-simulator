@@ -577,14 +577,14 @@ const C={
 // ═══════════════════════════════════════════════════════
 // § 7-A. 인증·저장 UI
 // ═══════════════════════════════════════════════════════
-function AuthBar({user,loading,signIn,signOut,onSave,onLoad,lastSaved}){
+function AuthBar({user,loading,signIn,signOut,onSave,onLoad,lastSaved,onModeSwitch}){
   return(
     <div style={{background:"#fff",borderBottom:`1px solid ${C.border}`,padding:"6px 18px",display:"flex",alignItems:"center",gap:"10px",flexWrap:"wrap",justifyContent:"flex-end"}}>
       {/* 저장/불러오기 */}
       <button onClick={onLoad} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C.mid,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>
         📂 불러오기
       </button>
-      <button onClick={()=>setMode("apartment")} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:"1.5px solid #7c3aed",background:"#f5f3ff",color:"#7c3aed",fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:700}}>
+      <button onClick={()=>onModeSwitch&&onModeSwitch("apartment")} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:"1.5px solid #7c3aed",background:"#f5f3ff",color:"#7c3aed",fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:700}}>
         🏠 공동주택
       </button>
       <button onClick={onSave} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.accent}`,background:C.accentBg,color:C.accent,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>
@@ -3482,7 +3482,8 @@ export default function App(){
 
       {/* 인증 + 저장 바 */}
       <AuthBar user={user} loading={authLoading} signIn={signIn} signOut={signOut}
-        onSave={handleSave} onLoad={handleLoad} lastSaved={lastSaved}/>
+        onSave={handleSave} onLoad={handleLoad} lastSaved={lastSaved}
+        onModeSwitch={setMode}/>
 
       {/* 대지 모드 */}
       <div style={{background:"#fff",borderBottom:`1px solid ${C.border}`,padding:"7px 18px",display:"flex",alignItems:"center",gap:"14px",flexWrap:"wrap"}}>
