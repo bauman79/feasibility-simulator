@@ -1,7 +1,26 @@
 import { useState, useMemo, useReducer, useCallback, useEffect, useRef } from "react";
+import { initializeApp } from "firebase/app";
+import { getAuth, GoogleAuthProvider, signInWithPopup, signOut as fbSignOut, onAuthStateChanged } from "firebase/auth";
+import { getFirestore, doc, setDoc, getDoc, collection, getDocs, deleteDoc, serverTimestamp } from "firebase/firestore";
 
 // ═══════════════════════════════════════════════════════
-// § 0. PWA 서비스워커 등록 (vite-plugin-pwa 없이 수동)
+// § 0. Firebase 초기화
+// ═══════════════════════════════════════════════════════
+const firebaseConfig = {
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+};
+
+const firebaseApp = initializeApp(firebaseConfig);
+const auth = getAuth(firebaseApp);
+const db = getFirestore(firebaseApp);
+
+// ═══════════════════════════════════════════════════════
+// § 0-A. PWA 서비스워커 등록
 // ═══════════════════════════════════════════════════════
 if(typeof window!=="undefined"&&"serviceWorker"in navigator){
   window.addEventListener("load",()=>{
@@ -10,45 +29,80 @@ if(typeof window!=="undefined"&&"serviceWorker"in navigator){
 }
 
 // ═══════════════════════════════════════════════════════
-// § 0-B. Firebase Auth 훅 (내일 연결용 — 현재 Mock)
+// § 0-B. Firebase Auth 훅 (실제 Google 로그인)
 // ═══════════════════════════════════════════════════════
-// TODO: import { initializeApp } from "firebase/app";
-// TODO: import { getAuth, GoogleAuthProvider, signInWithPopup } from "firebase/auth";
-// const firebaseConfig = { /* 내일 입력 */ };
-// const app = initializeApp(firebaseConfig);
-// const auth = getAuth(app);
-
 function useAuth(){
   const[user,setUser]=useState(null);
-  const[loading,setLoading]=useState(false);
-  // Mock — Firebase 연결 후 아래를 실제 코드로 교체
+  const[loading,setLoading]=useState(true);
+
+  useEffect(()=>{
+    const unsubscribe=onAuthStateChanged(auth,u=>{
+      setUser(u?{
+        name: u.displayName,
+        email: u.email,
+        photo: u.photoURL,
+        uid: u.uid,
+      }:null);
+      setLoading(false);
+    });
+    return unsubscribe;
+  },[]);
+
   const signIn=async()=>{
-    setLoading(true);
-    setTimeout(()=>{ setUser({name:"사용자",email:"user@gmail.com",photo:null}); setLoading(false); },800);
-    // 실제: const result = await signInWithPopup(auth, new GoogleAuthProvider()); setUser(result.user);
+    try{
+      const provider=new GoogleAuthProvider();
+      await signInWithPopup(auth,provider);
+    }catch(e){ console.error("로그인 실패:",e); }
   };
-  const signOut=()=>setUser(null);
-  // 실제: useEffect(()=>{ return onAuthStateChanged(auth, u=>setUser(u)); },[]);
+
+  const signOut=async()=>{
+    try{ await fbSignOut(auth); }catch(e){ console.error("로그아웃 실패:",e); }
+  };
+
   return{user,loading,signIn,signOut};
 }
 
 // ═══════════════════════════════════════════════════════
-// § 0-C. 저장/불러오기 (localStorage → Firebase 교체 예정)
+// § 0-C. Firestore 저장/불러오기
 // ═══════════════════════════════════════════════════════
-const SAVE_KEY="feasibility_v6_state";
-function saveState(state){
-  try{ localStorage.setItem(SAVE_KEY,JSON.stringify(state)); return true; }
-  catch(e){ return false; }
+const LOCAL_KEY="feasibility_v8_state";
+
+// 로컬 저장 (비로그인 시 폴백)
+function saveLocal(state){
+  try{ localStorage.setItem(LOCAL_KEY,JSON.stringify(state)); return true; }catch(e){ return false; }
 }
-function loadState(){
-  try{
-    const raw=localStorage.getItem(SAVE_KEY);
-    return raw?JSON.parse(raw):null;
-  }catch(e){ return null; }
+function loadLocal(){
+  try{ const r=localStorage.getItem(LOCAL_KEY); return r?JSON.parse(r):null; }catch(e){ return null; }
 }
-// TODO Firebase: import { doc, setDoc, getDoc } from "firebase/firestore";
-// async function saveStateCloud(uid,state){ await setDoc(doc(db,"projects",uid),{state}); }
-// async function loadStateCloud(uid){ const d=await getDoc(doc(db,"projects",uid)); return d.data()?.state; }
+
+// Firestore 저장 (로그인 시)
+async function saveToCloud(uid, state, projectName="기본 프로젝트"){
+  const id = "project_" + Date.now();
+  await setDoc(doc(db,"users",uid,"projects",id),{
+    name: projectName || "프로젝트",
+    state: JSON.stringify(state),
+    savedAt: serverTimestamp(),
+  });
+  return id;
+}
+
+// Firestore 프로젝트 목록 불러오기
+async function loadProjectList(uid){
+  const snap=await getDocs(collection(db,"users",uid,"projects"));
+  return snap.docs.map(d=>({id:d.id,...d.data(),savedAt:d.data().savedAt?.toDate?.()?.toLocaleString("ko-KR")||""}));
+}
+
+// 특정 프로젝트 불러오기
+async function loadFromCloud(uid, projectId){
+  const snap=await getDoc(doc(db,"users",uid,"projects",projectId));
+  if(!snap.exists()) return null;
+  return JSON.parse(snap.data().state);
+}
+
+// 프로젝트 삭제
+async function deleteProject(uid, projectId){
+  await deleteDoc(doc(db,"users",uid,"projects",projectId));
+}
 
 // ═══════════════════════════════════════════════════════
 // § 1. 법정 기준 데이터
@@ -577,16 +631,37 @@ const C={
 // ═══════════════════════════════════════════════════════
 // § 7-A. 인증·저장 UI
 // ═══════════════════════════════════════════════════════
-function AuthBar({user,loading,signIn,signOut,onSave,onLoad,lastSaved,onModeSwitch}){
+function AuthBar({user,loading,signIn,signOut,onSave,onLoad,lastSaved,onModeSwitch,saveMsg}){
   return(
     <div style={{background:"#fff",borderBottom:`1px solid ${C.border}`,padding:"6px 18px",display:"flex",alignItems:"center",gap:"10px",flexWrap:"wrap",justifyContent:"flex-end"}}>
-      {/* 저장/불러오기 */}
-      <button onClick={onLoad} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C.mid,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>
-        📂 불러오기
-      </button>
       <button onClick={()=>onModeSwitch&&onModeSwitch("apartment")} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:"1.5px solid #7c3aed",background:"#f5f3ff",color:"#7c3aed",fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:700}}>
         🏠 공동주택
       </button>
+      <div style={{width:"1px",height:"18px",background:C.border}}/>
+      <button onClick={onLoad} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C.mid,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>
+        📂 불러오기{user?" (클라우드)":""}
+      </button>
+      <button onClick={onSave} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.accent}`,background:C.accentBg,color:C.accent,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>
+        💾 저장{user?" (클라우드)":""}
+      </button>
+      {lastSaved&&<span style={{fontSize:"9px",color:C.muted}}>저장: {lastSaved}</span>}
+      {saveMsg&&<span style={{fontSize:"10px",color:C.green,fontWeight:600}}>{saveMsg}</span>}
+      <div style={{width:"1px",height:"20px",background:C.border,margin:"0 4px"}}/>
+      {user?(
+        <div style={{display:"flex",alignItems:"center",gap:"7px"}}>
+          {user.photo?<img src={user.photo} style={{width:"24px",height:"24px",borderRadius:"50%"}} alt=""/>:<div style={{width:"24px",height:"24px",borderRadius:"50%",background:C.accentBg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"13px"}}>👤</div>}
+          <span style={{fontSize:"11px",color:C.mid,fontWeight:600}}>{user.name||user.email}</span>
+          <button onClick={signOut} style={{fontSize:"10px",padding:"3px 8px",borderRadius:"5px",border:`1px solid ${C.border}`,background:"#fff",color:C.muted,cursor:"pointer",fontFamily:C.sans}}>로그아웃</button>
+        </div>
+      ):(
+        <button onClick={signIn} disabled={loading} style={{display:"flex",alignItems:"center",gap:"6px",padding:"5px 12px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C.mid,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600,opacity:loading?0.6:1}}>
+          <svg width="14" height="14" viewBox="0 0 24 24"><path fill="#4285f4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34a853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#fbbc05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/><path fill="#ea4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+          {loading?"확인 중...":"Google 로그인"}
+        </button>
+      )}
+    </div>
+  );
+}
       <button onClick={onSave} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.accent}`,background:C.accentBg,color:C.accent,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>
         💾 저장
       </button>
@@ -3383,22 +3458,70 @@ export default function App(){
   // 저장/불러오기
   const[lastSaved,setLastSaved]=useState(null);
   const[saveMsg,setSaveMsg]=useState(null);
-  const handleSave=()=>{
-    const ok=saveState(state);
-    const t=new Date().toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit"});
-    setLastSaved(t);
-    setSaveMsg(ok?"✓ 저장됨":"저장 실패");
-    setTimeout(()=>setSaveMsg(null),2000);
+  const[showLoadModal,setShowLoadModal]=useState(false);
+  const[projectList,setProjectList]=useState([]);
+  const[loadingProjects,setLoadingProjects]=useState(false);
+
+  const showMsg=(msg,isErr=false)=>{
+    setSaveMsg(msg);
+    setTimeout(()=>setSaveMsg(null),3000);
   };
-  const handleLoad=()=>{
-    const s=loadState();
-    if(!s){setSaveMsg("저장된 데이터 없음"); setTimeout(()=>setSaveMsg(null),2000); return;}
-    // 상태 전체 교체
-    Object.entries(s).forEach(([k,v])=>{
-      if(k!=="activeTab")dispatch({type:"SITE_MODE",p:s.siteMode||"single"});
-    });
-    // 간단하게 page reload 없이 로드: 실제로는 reducer에 LOAD_STATE action 추가 권장
-    setSaveMsg("✓ 불러옴"); setTimeout(()=>setSaveMsg(null),2000);
+
+  const handleSave=async()=>{
+    if(user){
+      // 클라우드 저장
+      try{
+        const projName=state.buildings?.[0]?.name||"프로젝트";
+        await saveToCloud(user.uid, state, projName);
+        const t=new Date().toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit"});
+        setLastSaved(t);
+        showMsg("✓ 클라우드 저장 완료");
+      }catch(e){ showMsg("저장 실패: "+e.message, true); }
+    } else {
+      // 로컬 저장
+      const ok=saveLocal(state);
+      const t=new Date().toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit"});
+      setLastSaved(t);
+      showMsg(ok?"✓ 로컬 저장됨 (Google 로그인 시 클라우드 저장)":"저장 실패");
+    }
+  };
+
+  const handleLoad=async()=>{
+    if(user){
+      // 클라우드 프로젝트 목록 표시
+      setLoadingProjects(true);
+      setShowLoadModal(true);
+      try{
+        const list=await loadProjectList(user.uid);
+        setProjectList(list.sort((a,b)=>new Date(b.savedAt)-new Date(a.savedAt)));
+      }catch(e){ showMsg("목록 불러오기 실패"); }
+      setLoadingProjects(false);
+    } else {
+      // 로컬 불러오기
+      const s=loadLocal();
+      if(!s){ showMsg("저장된 데이터 없음 (Google 로그인 시 클라우드에서 불러오기)"); return; }
+      showMsg("✓ 로컬에서 불러옴");
+    }
+  };
+
+  const handleLoadProject=async(projectId)=>{
+    try{
+      const s=await loadFromCloud(user.uid, projectId);
+      if(!s){ showMsg("불러오기 실패"); return; }
+      // 상태 교체 — 페이지 리로드로 안전하게 적용
+      saveLocal(s);
+      window.location.reload();
+    }catch(e){ showMsg("불러오기 실패: "+e.message); }
+    setShowLoadModal(false);
+  };
+
+  const handleDeleteProject=async(projectId)=>{
+    if(!window.confirm("이 프로젝트를 삭제하시겠습니까?")) return;
+    try{
+      await deleteProject(user.uid, projectId);
+      setProjectList(prev=>prev.filter(p=>p.id!==projectId));
+      showMsg("✓ 삭제됨");
+    }catch(e){ showMsg("삭제 실패"); }
   };
 
   // 토지이음 모달
@@ -3447,9 +3570,43 @@ export default function App(){
       {/* 토지이음 모달 */}
       {showEum&&<EumModal onClose={()=>setShowEum(false)}/>}
 
+      {/* 프로젝트 불러오기 모달 */}
+      {showLoadModal&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:9000,display:"flex",alignItems:"center",justifyContent:"center",padding:"16px"}}>
+          <div style={{background:"#fff",borderRadius:"12px",boxShadow:"0 20px 60px rgba(0,0,0,0.3)",width:"min(560px,95vw)",maxHeight:"80vh",display:"flex",flexDirection:"column",overflow:"hidden"}}>
+            <div style={{padding:"14px 18px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",gap:"10px"}}>
+              <span style={{fontSize:"16px"}}>📂</span>
+              <div style={{flex:1}}>
+                <div style={{fontSize:"13px",fontWeight:700}}>저장된 프로젝트</div>
+                <div style={{fontSize:"10px",color:C.muted}}>클라우드에 저장된 프로젝트를 불러옵니다</div>
+              </div>
+              <button onClick={()=>setShowLoadModal(false)} style={{width:"28px",height:"28px",borderRadius:"50%",border:`1px solid ${C.border}`,background:"#fff",cursor:"pointer",fontSize:"16px",fontWeight:700,fontFamily:C.sans}}>×</button>
+            </div>
+            <div style={{overflowY:"auto",padding:"12px"}}>
+              {loadingProjects?(
+                <div style={{textAlign:"center",padding:"30px",color:C.muted}}>불러오는 중...</div>
+              ):projectList.length===0?(
+                <div style={{textAlign:"center",padding:"30px",color:C.muted}}>저장된 프로젝트가 없습니다</div>
+              ):(
+                projectList.map(p=>(
+                  <div key={p.id} style={{display:"flex",alignItems:"center",gap:"10px",padding:"11px 14px",borderRadius:"8px",border:`1px solid ${C.border}`,marginBottom:"8px",background:"#fff"}}>
+                    <div style={{flex:1}}>
+                      <div style={{fontSize:"13px",fontWeight:600,color:C.text}}>{p.name}</div>
+                      <div style={{fontSize:"10px",color:C.muted,marginTop:"2px"}}>저장: {p.savedAt||"—"}</div>
+                    </div>
+                    <button onClick={()=>handleLoadProject(p.id)} style={{padding:"5px 14px",borderRadius:"6px",border:`1.5px solid ${C.accent}`,background:C.accentBg,color:C.accent,fontSize:"11px",fontWeight:600,cursor:"pointer",fontFamily:C.sans}}>불러오기</button>
+                    <button onClick={()=>handleDeleteProject(p.id)} style={{padding:"5px 10px",borderRadius:"6px",border:`1px solid ${C.border}`,background:"#fff",color:C.red,fontSize:"11px",cursor:"pointer",fontFamily:C.sans}}>삭제</button>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 저장 피드백 토스트 */}
       {saveMsg&&(
-        <div style={{position:"fixed",bottom:"24px",right:"24px",zIndex:9999,padding:"10px 18px",borderRadius:"9px",background:C.hdr,color:"#fff",fontSize:"13px",fontWeight:600,boxShadow:"0 4px 20px rgba(0,0,0,0.3)",transition:"all 0.2s"}}>
+        <div style={{position:"fixed",bottom:"24px",right:"24px",zIndex:9999,padding:"10px 18px",borderRadius:"9px",background:C.hdr,color:"#fff",fontSize:"13px",fontWeight:600,boxShadow:"0 4px 20px rgba(0,0,0,0.3)"}}>
           {saveMsg}
         </div>
       )}
@@ -3483,7 +3640,7 @@ export default function App(){
       {/* 인증 + 저장 바 */}
       <AuthBar user={user} loading={authLoading} signIn={signIn} signOut={signOut}
         onSave={handleSave} onLoad={handleLoad} lastSaved={lastSaved}
-        onModeSwitch={setMode}/>
+        onModeSwitch={setMode} saveMsg={saveMsg}/>
 
       {/* 대지 모드 */}
       <div style={{background:"#fff",borderBottom:`1px solid ${C.border}`,padding:"7px 18px",display:"flex",alignItems:"center",gap:"14px",flexWrap:"wrap"}}>
