@@ -2061,6 +2061,7 @@ const initAptState={
     interestIncomeR:"1.0",    // 이자수익 % (SH제공)
   },
   aptActiveTab:"building",
+  analysisMode:"standard", // "standard"=기본방식 / "sh"=SH재무성분석
 };
 
 // ════════════════════════════════════════════════════════════════
@@ -2314,15 +2315,20 @@ function calcAptRevenue(apt,area,cost){
 
 function calcAptAnalysis(apt,cost,rev){
   const an=apt.anlys||{};
+  const aptMode=apt.analysisMode||"standard";
+  const isSHMode=aptMode==="sh";
+
   const dr=(+(an.discountR)||4.5)/100;
-  const gd=(+(an.gdpDeflator)||4.37)/100;  // GDP디플레이터 (경상가 변환)
-  const landRiseR=(+(an.landRiseR)||3.1)/100; // 지가상승률
-  const priceMode=an.priceMode||"nominal";   // "nominal"불변가 / "real"경상가
-  const isReal=priceMode==="real";
+  const gd=(+(an.gdpDeflator)||4.37)/100;
+  const landRiseR=(+(an.landRiseR)||3.1)/100;
+  const priceMode=an.priceMode||"nominal";
+  const isReal=isSHMode&&priceMode==="real"; // 경상가는 SH모드에서만
 
   const constPeriod=+(apt.cost.constPeriod)||3;
-  const totalOpYears=+(an.totalOpYears)||40;
-  const totalYears=constPeriod+totalOpYears; // 전체 분석기간
+  // 기본방식: totalYears = constPeriod (공사기간만)
+  // SH방식: totalYears = constPeriod + 운영기간
+  const totalOpYears=isSHMode?(+(an.totalOpYears)||40):0;
+  const totalYears=constPeriod+totalOpYears;
 
   const{tdc,land,directConstr,indirect,other,reserve,loanR,maint}=cost;
   const{totalSale,normalSale,contractAmt,midAmt,balanceAmt,pkInc,
@@ -2473,6 +2479,19 @@ function aptReducer(state,{type,p}){
     };
     case"APT_FUNDING":  return{...state,funding:{...state.funding,...p}};
     case"APT_ANLYS_MODE": return{...state,anlys:{...state.anlys,priceMode:p}};
+    case"APT_MODE": return{...state, analysisMode:p,
+      // 모드 전환 시 기본값 세팅
+      ...(p==="sh"?{
+        cost:{...state.cost,mgmtR:"5.62",salesR:"0.38",directLaborR:"2.0",reserveR:"10.0",loanR:"2.76",maintR:"0.5",operYears:"40"},
+        revenue:{...state.revenue,convR:"4.5",vacancyR:"3",jeonse2VacancyR:"3",rentRiseR:"3.0",jeonseRate:"80"},
+        anlys:{...state.anlys,discountR:"4.5",gdpDeflator:"4.37",cpiR:"2.8",landRiseR:"3.1",totalOpYears:"40",priceMode:"nominal"},
+        funding:{...state.funding,housingFundRate:"2.3",bondRate:"2.76",interestIncomeR:"1.0",housingFundR:"60",bondR:"30",equityR:"10"},
+      }:{
+        cost:{...state.cost,mgmtR:"5.73",salesR:"0.27",reserveR:"10.0",loanR:"4.5",maintR:"0.5",operYears:"40"},
+        revenue:{...state.revenue,convR:"4.5",vacancyR:"5",rentRiseR:"3.0",jeonseRate:"80"},
+        anlys:{...state.anlys,discountR:"4.5",totalOpYears:"3",priceMode:"nominal"},
+      }),
+    };
     default: return state;
   }
 }
@@ -2612,7 +2631,8 @@ function AptBuildingTab({apt,dispatch,area,onEum}){
                     <td style={{...aTd(),fontFamily:C.mono,fontSize:"11px",fontWeight:700,textAlign:"right",color:C.teal}}>{t.contract.toFixed(2)}</td>
                     <td style={aTd()}>
                       <select value={orig.saleMode} onChange={e=>D("APT_TYPE",{id:t.id,k:"saleMode",v:e.target.value})} style={{fontSize:"10px",padding:"2px 4px",border:`1px solid ${C.border}`,borderRadius:"4px",fontFamily:C.sans,background:"#fff"}}>
-                        <option value="sale">분양</option><option value="rent">임대(월세)</option><option value="jeonse2">전세2(분양전환)</option>
+                        <option value="sale">분양</option><option value="rent">임대(월세)</option>
+                        {isSH&&<option value="jeonse2">전세2(분양전환)</option>}
                       </select>
                     </td>
                     <td style={aTd()}>
@@ -2740,7 +2760,7 @@ const aInpS=(w=70,color=C.text)=>({width:`${w}px`,border:`1px solid ${C.border}`
 // ════════════════════════════════════════════════════════════════
 // § APT-7. 사업비 탭
 // ════════════════════════════════════════════════════════════════
-function AptCostTab({apt,dispatch,area,cost,onEum}){
+function AptCostTab({apt,dispatch,area,cost,onEum,isSH}){
   const D=(t,p)=>dispatch({type:t,p});
   const c=apt.cost;
   const cc=cost;
@@ -2860,8 +2880,8 @@ function AptCostTab({apt,dispatch,area,cost,onEum}){
       {/* 부대비·예비비·금융 */}
       <Card title="부대비 · 예비비 · 금융비용" tag="OTHER COSTS" accentBar={C.amber} collapsible>
         <G cols="repeat(auto-fit,minmax(150px,1fr))">
-          <AInput label="일반관리비 요율" value={c.mgmtR} onChange={v=>D("APT_COST",{mgmtR:v})} unit="%" lawNote="기준사업비(토지+공사+간접)"/>
-          <AInput label="판매비 요율" value={c.salesR} onChange={v=>D("APT_COST",{salesR:v})} unit="%" lawNote="인천도시공사 기준 0.27%"/>
+          <AInput label="일반관리비 요율" value={c.mgmtR} onChange={v=>D("APT_COST",{mgmtR:v})} unit="%" lawNote={isSH?"SH: 5.62%":"인천도시공사: 5.73%"}/>
+          <AInput label="판매비 요율" value={c.salesR} onChange={v=>D("APT_COST",{salesR:v})} unit="%" lawNote={isSH?"SH: 0.38%":"인천도시공사: 0.27%"}/>
           <AInput label="예비비 요율" value={c.reserveR} onChange={v=>D("APT_COST",{reserveR:v})} unit="%" lawNote="기준사업비 10% 통상"/>
           <AInput label="연 금리" value={c.loanR} onChange={v=>D("APT_COST",{loanR:v})} unit="%"/>
           <AInput label="공사기간" value={c.constPeriod} onChange={v=>D("APT_COST",{constPeriod:v})} unit="년"/>
@@ -2875,8 +2895,8 @@ function AptCostTab({apt,dispatch,area,cost,onEum}){
         </G>
       </Card>
 
-      {/* 수선유지비 (SH 재무성분석) */}
-      <Card title="수선유지비 (운영기간)" tag="MAINTENANCE COST" accentBar={C.teal} collapsible>
+      {/* 수선유지비 (SH 전용) */}
+      {isSH&&<Card title="수선유지비 (운영기간)" tag="MAINTENANCE COST — SH 재무성분석" accentBar={C.teal} collapsible>
         <div style={{marginBottom:"8px",padding:"7px 11px",background:C.tealBg,border:`1px solid ${C.teal}30`,borderRadius:"7px",fontSize:"10px",color:C.teal,lineHeight:1.7}}>
           <ModeTag label="SH 재무성분석 항목" color={C.teal}/> 운영기간 동안 발생하는 수선유지비. 건축비(직접공사비) 기준 요율 × 운영년수 합산.
           SH기준: 0.5%/년 × 40년 = 건축비의 20% 수준
@@ -2888,9 +2908,9 @@ function AptCostTab({apt,dispatch,area,cost,onEum}){
           <KpiCard label="TDC+수선유지비 합계" value={fM(cc.tdcWithMaint*1000)} unit="" hi sub="금융비용+수선유지비 포함"/>
         </G>
         <div style={{marginTop:"8px",padding:"7px 11px",background:C.cardAlt,borderRadius:"7px",fontSize:"9px",color:C.muted}}>
-          * 수선유지비는 TDC와 별도로 운영기간 중 지출되는 비용입니다. 사업성 분석에서 운영기간 현금흐름에 반영됩니다 (4~6단계 구현 예정).
+          * 수선유지비는 TDC와 별도로 운영기간 중 지출되는 비용입니다. 사업성 분석에서 운영기간 현금흐름에 반영됩니다.
         </div>
-      </Card>
+      </Card>}
 
       {/* TDC 요약 */}
       <div style={{background:"#fff",border:`2px solid ${C.amber}30`,borderRadius:"12px",padding:"16px 18px",boxShadow:C.shadowMd}}>
@@ -2914,7 +2934,7 @@ function AptCostTab({apt,dispatch,area,cost,onEum}){
 // ════════════════════════════════════════════════════════════════
 // § APT-8. 분양수입 탭
 // ════════════════════════════════════════════════════════════════
-function AptRevenueTab({apt,dispatch,area,rev}){
+function AptRevenueTab({apt,dispatch,area,rev,isSH}){
   const D=(t,p)=>dispatch({type:t,p});
   const r=apt.revenue;
 
@@ -2946,7 +2966,8 @@ function AptRevenueTab({apt,dispatch,area,rev}){
                     <td style={{padding:"5px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"11px",color:C.green,fontWeight:600,borderRight:`1px solid ${C.border}`}}>{t.tSupply.toFixed(1)}</td>
                     <td style={{padding:"5px 8px",borderRight:`1px solid ${C.border}`}}>
                       <select value={orig.saleMode||"sale"} onChange={e=>D("APT_TYPE",{id:t.id,k:"saleMode",v:e.target.value})} style={{fontSize:"10px",padding:"2px 4px",border:`1px solid ${C.border}`,borderRadius:"4px",fontFamily:C.sans,background:"#fff"}}>
-                        <option value="sale">분양</option><option value="rent">임대(월세)</option><option value="jeonse2">전세2(분양전환)</option>
+                        <option value="sale">분양</option><option value="rent">임대(월세)</option>
+                        {isSH&&<option value="jeonse2">전세2(분양전환)</option>}
                       </select>
                     </td>
                     <td style={{padding:"5px 8px",textAlign:"right",borderRight:`1px solid ${C.border}`}}>
@@ -3255,7 +3276,7 @@ function AptFundingTab({apt,dispatch,cost,area}){
 // ════════════════════════════════════════════════════════════════
 // § APT-9. 사업성 분석 탭
 // ════════════════════════════════════════════════════════════════
-function AptAnalysisTab({apt,dispatch,cost,rev,ana}){
+function AptAnalysisTab({apt,dispatch,cost,rev,ana,isSH}){
   const D=(t,p)=>dispatch({type:t,p});
   const[showAllYears,setShowAllYears]=useState(false); // 전체기간 표시 토글
   const startY=+(apt.cost.startYear)||2025;
@@ -3274,8 +3295,8 @@ function AptAnalysisTab({apt,dispatch,cost,rev,ana}){
     <div>
       {/* 분석 파라미터 */}
       <Card title="분석 파라미터" tag="PARAMETERS">
-        {/* 불변가/경상가 토글 (4번) */}
-        <div style={{display:"flex",alignItems:"center",gap:"10px",marginBottom:"12px",padding:"9px 13px",background:isReal?"#fef3c7":"#f0f9ff",border:`1.5px solid ${isReal?C.amber:"#0ea5e9"}`,borderRadius:"8px"}}>
+        {/* 불변가/경상가 토글 (SH 전용) */}
+        {isSH&&<div style={{display:"flex",alignItems:"center",gap:"10px",marginBottom:"12px",padding:"9px 13px",background:isReal?"#fef3c7":"#f0f9ff",border:`1.5px solid ${isReal?C.amber:"#0ea5e9"}`,borderRadius:"8px"}}>
           <span style={{fontSize:"11px",fontWeight:700,color:isReal?C.amber:"#0369a1"}}>
             {isReal?"📈 경상가 모드 (물가상승 반영)":"📊 불변가 모드 (현재가치 기준)"}
           </span>
@@ -3288,12 +3309,12 @@ function AptAnalysisTab({apt,dispatch,cost,rev,ana}){
             ))}
           </div>
           {isReal&&<span style={{fontSize:"9px",color:C.amber}}>GDP디플레이터 {apt.anlys?.gdpDeflator||"4.37"}% 적용</span>}
-        </div>
+        </div>}
         <G cols="repeat(auto-fit,minmax(140px,1fr))">
           <AInput label="할인율" value={apt.anlys?.discountR||"4.5"} onChange={v=>D("APT_ANLYS",{discountR:v})} unit="%" lawNote="KDI: 4.5%"/>
-          {isReal&&<AInput label="GDP디플레이터" value={apt.anlys?.gdpDeflator||"4.37"} onChange={v=>D("APT_ANLYS",{gdpDeflator:v})} unit="%" lawNote="SH:4.37%"/>}
-          <AInput label="전체 분석기간" value={apt.anlys?.totalOpYears||"40"} onChange={v=>D("APT_ANLYS",{totalOpYears:v})} unit="년" lawNote="운영기간 포함"/>
-          <AInput label="토지잔존가치율" value={apt.anlys?.landResidualR||"100"} onChange={v=>D("APT_ANLYS",{landResidualR:v})} unit="%" lawNote="사업종료 토지가"/>
+          {isSH&&isReal&&<AInput label="GDP디플레이터" value={apt.anlys?.gdpDeflator||"4.37"} onChange={v=>D("APT_ANLYS",{gdpDeflator:v})} unit="%" lawNote="SH:4.37%"/>}
+          {isSH&&<AInput label="전체 분석기간" value={apt.anlys?.totalOpYears||"40"} onChange={v=>D("APT_ANLYS",{totalOpYears:v})} unit="년" lawNote="운영기간 포함"/>}
+          {isSH&&<AInput label="토지잔존가치율" value={apt.anlys?.landResidualR||"100"} onChange={v=>D("APT_ANLYS",{landResidualR:v})} unit="%" lawNote="사업종료 토지가"/>}
           <KpiCard label="공사기간" value={`${constPeriod}년`} unit="" sub="사업비탭에서 설정"/>
           <KpiCard label="총사업비(TDC)" value={fM(cost.tdcTotal*1000)} unit=""/>
           <KpiCard label="총 분양수입" value={fM(rev.totalSale*1000)} unit="" ok2={rev.totalSale>cost.tdc}/>
@@ -3329,18 +3350,22 @@ function AptAnalysisTab({apt,dispatch,cost,rev,ana}){
             <div style={{fontSize:"9px",color:C.muted,marginTop:"4px"}}>수익률(PV): {fP(ana.profitR)}% | BEP: {ana.bepYear!==null?`${ana.bepYear}년차`:"미도달"}</div>
           </div>
         </G>
-        <div style={{marginTop:"9px",padding:"8px 12px",background:isReal?"#fef3c7":"#f0f9ff",borderRadius:"7px",fontSize:"10px",color:isReal?C.amber:"#0369a1"}}>
-          {isReal?"📈 경상가(물가상승 반영) 기준 — 비용·수입에 GDP디플레이터 누적 적용":"📊 불변가(현재가치) 기준 — 모든 현금흐름을 기준시점 가치로 환산"}
-          {" | 할인율 "}{apt.anlys?.discountR||4.5}{"% 적용 | 전체 분석기간 "}{ana.totalYears}{"년"}
-        </div>
+        {isSH&&<div style={{marginTop:"9px",padding:"8px 12px",background:isReal?"#fef3c7":"#f0f9ff",borderRadius:"7px",fontSize:"10px",color:isReal?C.amber:"#0369a1"}}>
+          {isReal?"📈 경상가(물가상승 반영) 기준":"📊 불변가(현재가치) 기준"}
+          {" | 할인율 "}{apt.anlys?.discountR||4.5}{"% | 전체 분석기간 "}{ana.totalYears}{"년"}
+        </div>}
+        {!isSH&&<div style={{marginTop:"9px",padding:"8px 12px",background:C.accentBg,borderRadius:"7px",fontSize:"10px",color:C.accent}}>
+          🔷 기본방식 — 공사기간({ana.constPeriod}년) 기준 현재가치 분석. 할인율 {apt.anlys?.discountR||4.5}% 적용.
+        </div>}
       </Card>
 
       {/* 연도별 현금흐름 — 운영기간 포함 전체 (6번) */}
       <Card title="연도별 현금흐름 (전체 사업기간)" tag="ANNUAL CASH FLOW — FULL PERIOD">
         <div style={{marginBottom:"9px",padding:"7px 11px",background:C.cardAlt,borderRadius:"7px",fontSize:"10px",color:C.muted,lineHeight:1.7}}>
-          건설기간({constPeriod}년) + 운영기간({apt.anlys?.totalOpYears||40}년) = 전체 {ana.totalYears}년 현금흐름.
-          {isReal?" 경상가(GDP디플레이터 누적) 적용.":" 불변가(현재가치 기준) 적용."}
-          임대료 {apt.revenue?.rentRiseR||3}%/2년 상승 반영.
+          {isSH
+            ?<>건설기간({constPeriod}년) + 운영기간({apt.anlys?.totalOpYears||40}년) = 전체 {ana.totalYears}년 현금흐름. {isReal?" 경상가 적용.":" 불변가 기준."} 임대료 {apt.revenue?.rentRiseR||3}%/2년 상승 반영.</>
+            :<>🔷 기본방식: 0년차(토지·계약금) → {constPeriod-1}년차(공사·중도금) → {constPeriod}년차(준공·잔금). 공사기간 기준 현금흐름.</>
+          }
         </div>
         <div style={{display:"flex",justifyContent:"flex-end",marginBottom:"8px"}}>
           <button onClick={()=>setShowAllYears(!showAllYears)} style={{padding:"4px 12px",borderRadius:"6px",border:`1.5px solid ${C.accent}`,background:showAllYears?C.accentBg:"#fff",color:C.accent,fontSize:"11px",cursor:"pointer",fontFamily:C.sans,fontWeight:600}}>
@@ -3811,11 +3836,12 @@ function AptCriteriaTab({dispatch}){
 // ════════════════════════════════════════════════════════════════
 // § APT-12. 공동주택 메인 컴포넌트
 // ════════════════════════════════════════════════════════════════
-const APT_TABS=[
+// 탭은 모드에 따라 동적으로 구성 (함수로 반환)
+const getAptTabs=(mode)=>[
   {id:"building", label:"건축개요",  icon:"📐"},
   {id:"cost",     label:"사업비",    icon:"💰"},
   {id:"revenue",  label:"분양수입",  icon:"🏠"},
-  {id:"funding",  label:"재원조달",  icon:"🏦"},
+  ...(mode==="sh"?[{id:"funding", label:"재원조달", icon:"🏦"}]:[]),
   {id:"analysis", label:"사업성분석",icon:"🔍"},
   {id:"flow",     label:"산출내역",  icon:"🔁"},
   {id:"criteria", label:"검토기준",  icon:"📋"},
@@ -3824,6 +3850,10 @@ const APT_TABS=[
 function AptMode({onSwitch,user,authLoading,signIn,signOut,onSave,onLoad,lastSaved}){
   const[apt,aptDispatch]=useReducer(aptReducer,initAptState);
   const[showEum,setShowEum]=useState(false);
+  const[showModeGuide,setShowModeGuide]=useState(false);
+  const aptMode=apt.analysisMode||"standard";
+  const isSH=aptMode==="sh";
+  const APT_TABS=getAptTabs(aptMode);
 
   const area=useMemo(()=>calcAptArea(apt),[apt.types,apt.nonResi,apt.parking,apt.siteInfo]);
   const cost=useMemo(()=>calcAptCost(apt,area),[apt,area]);
@@ -3846,6 +3876,12 @@ function AptMode({onSwitch,user,authLoading,signIn,signOut,onSave,onLoad,lastSav
             {apt.projectName&&<span style={{fontSize:"11px",color:"#a78bfa",marginLeft:"8px"}}>— {apt.projectName}</span>}
           </div>
           <div style={{fontSize:"9px",color:"#7c3aed",letterSpacing:"0.04em"}}>Apartment Feasibility Simulator · v1.0</div>
+        </div>
+        {/* 모드 선택 배지 */}
+        <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+          <div style={{padding:"4px 10px",borderRadius:"6px",background:isSH?"#78350f":"#1e3a5f",border:`1.5px solid ${isSH?"#f59e0b":"#60a5fa"}`,fontSize:"10px",fontWeight:700,color:isSH?"#fcd34d":"#93c5fd"}}>
+            {isSH?"🏢 SH 재무성분석":"🔷 기본 방식"}
+          </div>
         </div>
         {tdc>0&&totSale>0&&(
           <div style={{display:"flex",gap:"14px",flexWrap:"wrap"}}>
@@ -3879,6 +3915,70 @@ function AptMode({onSwitch,user,authLoading,signIn,signOut,onSave,onLoad,lastSav
         )}
       </div>
 
+      {/* 모드 선택 배너 */}
+      <div style={{background:isSH?"#fffbeb":"#f0f9ff",borderBottom:`1px solid ${isSH?"#f59e0b30":"#0ea5e930"}`,padding:"8px 18px",display:"flex",alignItems:"center",gap:"12px",flexWrap:"wrap"}}>
+        <span style={{fontSize:"11px",fontWeight:600,color:C.mid}}>분석 방식 선택:</span>
+        <div style={{display:"flex",gap:"6px"}}>
+          {[
+            ["standard","🔷 기본방식","민간사업·일반 타당성","#1d4ed8","#eff6ff"],
+            ["sh","🏢 SH 재무성분석","공공임대·SH 재무모델","#92400e","#fffbeb"],
+          ].map(([mode,label,desc,color,bg])=>(
+            <button key={mode} onClick={()=>aptDispatch({type:"APT_MODE",p:mode})}
+              style={{padding:"6px 14px",borderRadius:"8px",border:`2px solid ${aptMode===mode?color:"transparent"}`,
+                background:aptMode===mode?bg:"#fff",color:aptMode===mode?color:C.muted,
+                fontSize:"11px",fontWeight:aptMode===mode?700:400,cursor:"pointer",fontFamily:C.sans,
+                boxShadow:aptMode===mode?"0 0 0 1px "+color+"30":"none",
+                transition:"all 0.15s"}}>
+              <div>{label}</div>
+              <div style={{fontSize:"9px",fontWeight:400,opacity:0.8}}>{desc}</div>
+            </button>
+          ))}
+        </div>
+        <button onClick={()=>setShowModeGuide(!showModeGuide)} style={{marginLeft:"auto",fontSize:"10px",color:C.accent,background:"transparent",border:"none",cursor:"pointer",fontFamily:C.sans,textDecoration:"underline"}}>
+          차이점 보기
+        </button>
+      </div>
+
+      {/* 모드 차이점 가이드 (접기/펼치기) */}
+      {showModeGuide&&(
+        <div style={{background:"#f8fafc",borderBottom:`1px solid ${C.border}`,padding:"12px 18px"}}>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:"10px"}}>
+            {[
+              {title:"🔷 기본방식 (민간사업)", color:"#1d4ed8", bg:"#eff6ff", items:[
+                "분석기간: 공사기간(3~5년) 기준",
+                "현금흐름: 분양수입 단순 계산",
+                "임대유형: 분양 / 임대(월세)",
+                "재원조달: 단일 금리 입력",
+                "수선유지비: 없음",
+                "관리비: 인천도시공사 기준 (5.73%)",
+                "SH 재원조달 탭: 없음",
+              ]},
+              {title:"🏢 SH 재무성분석", color:"#92400e", bg:"#fffbeb", items:[
+                "분석기간: 전체 사업기간 (최대 50년)",
+                "현금흐름: 불변가 / 경상가 선택",
+                "임대유형: + 전세2(분양전환형) 추가",
+                "재원조달: 기금+공사채+자체자금 분리",
+                "수선유지비: 건축비 × 0.5% × 운영기간",
+                "관리비: SH 제공 기준 (5.62%)",
+                "SH 재원조달 탭: 있음 (🏦 탭)",
+              ]},
+            ].map(({title,color,bg,items})=>(
+              <div key={title} style={{background:bg,border:`1px solid ${color}30`,borderRadius:"8px",padding:"10px 13px"}}>
+                <div style={{fontSize:"12px",fontWeight:700,color,marginBottom:"7px"}}>{title}</div>
+                {items.map(item=>(
+                  <div key={item} style={{fontSize:"10px",color:C.mid,lineHeight:1.8,display:"flex",gap:"5px"}}>
+                    <span style={{color,flexShrink:0}}>•</span>{item}
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+          <div style={{marginTop:"8px",fontSize:"9px",color:C.muted,textAlign:"center"}}>
+            * 모드 전환 시 관련 기준값이 자동으로 변경됩니다. 입력한 면적·사업비 데이터는 유지됩니다.
+          </div>
+        </div>
+      )}
+
       {/* 탭 */}
       <div style={{background:"#fff",borderBottom:`1.5px solid ${C.border}`,padding:"0 18px",display:"flex",overflowX:"auto"}}>
         {APT_TABS.map(({id,label,icon})=>{
@@ -3894,11 +3994,11 @@ function AptMode({onSwitch,user,authLoading,signIn,signOut,onSave,onLoad,lastSav
 
       {/* 콘텐츠 */}
       <div style={{maxWidth:"1100px",margin:"0 auto",padding:"14px"}}>
-        {apt.aptActiveTab==="building" &&<AptBuildingTab apt={apt} dispatch={aptDispatch} area={area} onEum={()=>setShowEum(true)}/>}
-        {apt.aptActiveTab==="cost"     &&<AptCostTab     apt={apt} dispatch={aptDispatch} area={area} cost={cost} onEum={()=>setShowEum(true)}/>}
-        {apt.aptActiveTab==="revenue"  &&<AptRevenueTab  apt={apt} dispatch={aptDispatch} area={area} rev={rev}/>}
+        {apt.aptActiveTab==="building" &&<AptBuildingTab apt={apt} dispatch={aptDispatch} area={area} onEum={()=>setShowEum(true)} isSH={isSH}/>}
+        {apt.aptActiveTab==="cost"     &&<AptCostTab     apt={apt} dispatch={aptDispatch} area={area} cost={cost} onEum={()=>setShowEum(true)} isSH={isSH}/>}
+        {apt.aptActiveTab==="revenue"  &&<AptRevenueTab  apt={apt} dispatch={aptDispatch} area={area} rev={rev} isSH={isSH}/>}
         {apt.aptActiveTab==="funding"  &&<AptFundingTab  apt={apt} dispatch={aptDispatch} cost={cost} area={area}/>}
-        {apt.aptActiveTab==="analysis" &&<AptAnalysisTab apt={apt} dispatch={aptDispatch} cost={cost} rev={rev} ana={ana}/>}
+        {apt.aptActiveTab==="analysis" &&<AptAnalysisTab apt={apt} dispatch={aptDispatch} cost={cost} rev={rev} ana={ana} isSH={isSH}/>}
         {apt.aptActiveTab==="flow"     &&<AptFlowTab     apt={apt} area={area} cost={cost} rev={rev} ana={ana}/>}
         {apt.aptActiveTab==="criteria" &&<AptCriteriaTab dispatch={aptDispatch}/>}
       </div>
