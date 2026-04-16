@@ -1,4 +1,4 @@
-import { useState, useMemo, useReducer, useCallback, useEffect, useRef } from "react";
+import React, { useState, useMemo, useReducer, useCallback, useEffect, useRef } from "react";
 import { initializeApp } from "firebase/app";
 import { getAuth, GoogleAuthProvider, signInWithPopup, signOut as fbSignOut, onAuthStateChanged } from "firebase/auth";
 import { getFirestore, doc, setDoc, getDoc, collection, getDocs, deleteDoc, serverTimestamp } from "firebase/firestore";
@@ -1904,11 +1904,11 @@ function AnalysisTab({state,dispatch,allCalcs}){
 
 // 업로드된 면적표를 기본값으로 설정
 const DEFAULT_APT_TYPES = [
-  { typeLabel:"39", units:168, exclArea:39.96, coreCommon:13.14, wallCommon:4.51, amenity:2.32, mechElec:4.31, ugParking:28.86, saleMode:"sale", salePrice:"", rentUnit:"", depositUnit:"" },
-  { typeLabel:"49", units:188, exclArea:49.96, coreCommon:14.14, wallCommon:5.51, amenity:2.90, mechElec:5.39, ugParking:36.08, saleMode:"sale", salePrice:"", rentUnit:"", depositUnit:"" },
-  { typeLabel:"59", units:445, exclArea:59.96, coreCommon:16.82, wallCommon:5.83, amenity:3.48, mechElec:6.47, ugParking:43.30, saleMode:"sale", salePrice:"", rentUnit:"", depositUnit:"" },
-  { typeLabel:"74", units:102, exclArea:74.96, coreCommon:20.22, wallCommon:6.73, amenity:4.35, mechElec:8.08, ugParking:54.13, saleMode:"sale", salePrice:"", rentUnit:"", depositUnit:"" },
-  { typeLabel:"84", units:184, exclArea:84.96, coreCommon:21.97, wallCommon:7.28, amenity:4.93, mechElec:9.16, ugParking:61.36, saleMode:"sale", salePrice:"", rentUnit:"", depositUnit:"" },
+  { typeLabel:"39", units:168, exclArea:39.96, coreCommon:13.14, wallCommon:4.51, amenity:2.32, mechElec:4.31, ugParking:28.86, saleMode:"sale", salePrice:"", rentUnit:"", depositUnit:"", jeonse2Deposit:"", jeonse2ConvYear:"20", jeonse2ConvRate:"100", jeonse2ConvPrice:"" },
+  { typeLabel:"49", units:188, exclArea:49.96, coreCommon:14.14, wallCommon:5.51, amenity:2.90, mechElec:5.39, ugParking:36.08, saleMode:"sale", salePrice:"", rentUnit:"", depositUnit:"", jeonse2Deposit:"", jeonse2ConvYear:"20", jeonse2ConvRate:"100", jeonse2ConvPrice:"" },
+  { typeLabel:"59", units:445, exclArea:59.96, coreCommon:16.82, wallCommon:5.83, amenity:3.48, mechElec:6.47, ugParking:43.30, saleMode:"sale", salePrice:"", rentUnit:"", depositUnit:"", jeonse2Deposit:"", jeonse2ConvYear:"20", jeonse2ConvRate:"100", jeonse2ConvPrice:"" },
+  { typeLabel:"74", units:102, exclArea:74.96, coreCommon:20.22, wallCommon:6.73, amenity:4.35, mechElec:8.08, ugParking:54.13, saleMode:"sale", salePrice:"", rentUnit:"", depositUnit:"", jeonse2Deposit:"", jeonse2ConvYear:"20", jeonse2ConvRate:"100", jeonse2ConvPrice:"" },
+  { typeLabel:"84", units:184, exclArea:84.96, coreCommon:21.97, wallCommon:7.28, amenity:4.93, mechElec:9.16, ugParking:61.36, saleMode:"sale", salePrice:"", rentUnit:"", depositUnit:"", jeonse2Deposit:"", jeonse2ConvYear:"20", jeonse2ConvRate:"100", jeonse2ConvPrice:"" },
 ];
 
 // 설계비 요율 — 건축사협회 건축설계 대가기준 (2종중급)
@@ -2376,7 +2376,7 @@ function calcAptAnalysis(apt,cost,rev){
       label=`운영${opY}년`;
 
       // 전세2 분양전환 수입 — 해당 연도에 일시 발생
-      typeRevs.forEach(t=>{
+      (typeRevs||[]).forEach(t=>{
         if(t.saleMode==="jeonse2"&&t.convInc>0){
           const convY=constPeriod+(+(t.jeonse2ConvYear)||20);
           if(y===convY) inc+=toReal(t.convInc,y);
@@ -2955,7 +2955,7 @@ function AptRevenueTab({apt,dispatch,area,rev,isSH}){
               </tr>
             </thead>
             <tbody>
-              {rev.typeRevs.map((t,idx)=>{
+              {(rev.typeRevs||[]).map((t,idx)=>{
                 const orig=apt.types.find(x=>x.id===t.id)||{};
                 const isSale=t.saleMode==="sale";
                 return(
@@ -3591,8 +3591,8 @@ function AptFlowTab({apt,area,cost,rev,ana}){
         {ana&&<div>
           <div style={{fontSize:"12px",fontWeight:700,color:C.purple,marginBottom:"9px",paddingBottom:"5px",borderBottom:`2px solid ${C.purple}20`}}>🔍 사업성 분석</div>
           <FBox title="① 현금흐름 구성 (주요 연도)" color={C.purple} items={
-            ana.cfs.filter(cf=>cf.y<=ana.constPeriod||cf.y===ana.totalYears||(cf.y-ana.constPeriod)%10===0)
-              .map(cf=>[`${+(apt.cost.startYear)+cf.y}년(${cf.y}년차) ${cf.label}`,`순: ${fM(cf.net*1000)}원`,`지출 ${fM(cf.out*1000)} / 수입 ${fM(cf.inc*1000)}`])
+            (ana.cfs||[]).filter(cf=>cf.y<=ana.constPeriod||cf.y===ana.totalYears||(cf.y-ana.constPeriod)%10===0)
+              .map(cf=>[`${+(apt.cost.startYear)+cf.y}년(${cf.y}년차) ${cf.label||""}`,`순: ${fM(cf.net*1000)}원`,`지출 ${fM(cf.out*1000)} / 수입 ${fM(cf.inc*1000)}`])
           } note={`전체 ${ana.totalYears}년 | 건설 ${ana.constPeriod}년 + 운영 ${ana.totalOpYears}년`}/>
           <div style={{textAlign:"center",fontSize:"16px",color:C.muted,margin:"3px 0"}}>↓</div>
           <FBox title="② 현재가치 할인 (IRR 산출)" color={C.purple} items={[
@@ -3836,6 +3836,34 @@ function AptCriteriaTab({dispatch}){
 // ════════════════════════════════════════════════════════════════
 // § APT-12. 공동주택 메인 컴포넌트
 // ════════════════════════════════════════════════════════════════
+// ── Error Boundary (공동주택 모드 오류 포착용) ──
+class AptErrorBoundary extends React.Component{
+  constructor(props){ super(props); this.state={hasError:false,error:null}; }
+  static getDerivedStateFromError(error){ return{hasError:true,error}; }
+  componentDidCatch(error,info){ console.error("AptMode 오류:",error,info); }
+  render(){
+    if(this.state.hasError){
+      return(
+        <div style={{fontFamily:"sans-serif",padding:"40px 24px",maxWidth:"600px",margin:"0 auto",textAlign:"center"}}>
+          <div style={{fontSize:"48px",marginBottom:"16px"}}>⚠️</div>
+          <h2 style={{color:"#dc2626",fontSize:"18px",marginBottom:"12px"}}>공동주택 검토기 오류가 발생했습니다</h2>
+          <div style={{background:"#fee2e2",border:"1px solid #fca5a5",borderRadius:"8px",padding:"12px 16px",textAlign:"left",marginBottom:"20px",fontSize:"12px",fontFamily:"monospace",color:"#7f1d1d",wordBreak:"break-all"}}>
+            {this.state.error?.message||"알 수 없는 오류"}
+          </div>
+          <button onClick={()=>{this.setState({hasError:false,error:null});this.props.onSwitch("general");}}
+            style={{padding:"10px 24px",borderRadius:"8px",border:"none",background:"#2563eb",color:"#fff",fontSize:"14px",cursor:"pointer",fontFamily:"sans-serif"}}>
+            ← 일반건축물로 돌아가기
+          </button>
+          <div style={{marginTop:"12px",fontSize:"11px",color:"#6b7280"}}>
+            브라우저 콘솔(F12)에서 상세 오류를 확인하세요
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 // 탭은 모드에 따라 동적으로 구성 (함수로 반환)
 const getAptTabs=(mode)=>[
   {id:"building", label:"건축개요",  icon:"📐"},
@@ -4133,9 +4161,11 @@ export default function App(){
 
   // 공동주택 모드
   if(mode==="apartment") return(
-    <AptMode onSwitch={setMode} user={user} authLoading={authLoading}
-      signIn={signIn} signOut={signOut}
-      onSave={handleSave} onLoad={handleLoad} lastSaved={lastSaved}/>
+    <AptErrorBoundary onSwitch={setMode}>
+      <AptMode onSwitch={setMode} user={user} authLoading={authLoading}
+        signIn={signIn} signOut={signOut}
+        onSave={handleSave} onLoad={handleLoad} lastSaved={lastSaved}/>
+    </AptErrorBoundary>
   );
 
   return(
