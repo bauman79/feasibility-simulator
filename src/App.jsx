@@ -2529,7 +2529,7 @@ function ModeTag({label,color}){ return <span style={{fontSize:"8px",padding:"1p
 // ════════════════════════════════════════════════════════════════
 // § APT-6. 건축개요 탭
 // ════════════════════════════════════════════════════════════════
-function AptBuildingTab({apt,dispatch,area,onEum}){
+function AptBuildingTab({apt,dispatch,area,onEum,isSH}){
   const D=(t,p)=>dispatch({type:t,p});
   const si=apt.siteInfo;
   const pk=apt.parking;
