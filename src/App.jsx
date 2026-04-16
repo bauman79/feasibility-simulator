@@ -1951,6 +1951,11 @@ const mkAptType=(overrides={})=>({
   exclArea:59.96, coreCommon:16.82, wallCommon:5.83,
   amenity:3.48, mechElec:6.47, ugParking:43.30,
   saleMode:"sale", salePrice:"", rentUnit:"", depositUnit:"",
+  // 전세2(분양전환형) 전용 필드
+  jeonse2Deposit:"",    // 전세보증금 (원/㎡, 시세 × 전세가율 기준)
+  jeonse2ConvYear:"20", // 분양전환까지 운영기간 (년)
+  jeonse2ConvRate:"100",// 분양전환가율 (준공시 감정가의 %)
+  jeonse2ConvPrice:"",  // 분양전환가격 (천원/공급㎡, 빈값=보증금+전환율적용 자동)
   ...overrides,
 });
 const mkNonResi=(overrides={})=>({
@@ -2016,6 +2021,12 @@ const initAptState={
     loanR:"4.5",             // 연 금리 %
     constPeriod:"3",         // 공사기간 년
     startYear:"2025",        // 사업 시작년도
+    // 수선유지비 (운영기간)
+    maintR:"0.5",            // 수선유지비율 % (건축비 기준 / 년)
+    operYears:"40",          // 운영기간 년 (수선유지비 계산용)
+    // SH 재무성분석 전용
+    directLaborR:"2.0",      // 직접인건비 % (SH: 2.0%)
+    jiboPriceR:"0.0",        // 지보충당금 % (필요시)
   },
   revenue:{
     contractR:"10",  // 계약금 % — 분양 스케줄
@@ -2023,9 +2034,31 @@ const initAptState={
     balanceR:"40",   // 잔금 %
     convR:"4.5",     // 보증금 전환율 % (임대 시)
     vacancyR:"5",    // 공실률 % (임대 시)
+    jeonse2VacancyR:"3",  // 전세2 공실률 (SH기준 3%)
+    rentRiseR:"3.0",      // 임대료·보증금 상승률 % (SH: 3.0%, 2년마다)
+    jeonseRate:"80",      // 전세가율 % (시세 대비, SH: 80%)
   },
   anlys:{
-    discountR:"4.5",  // 할인율 % (= 금리)
+    discountR:"4.5",      // 할인율 % (= 금리, SH/KDI: 4.5%)
+    gdpDeflator:"4.37",   // GDP디플레이터 % (SH: 5년평균 4.37%)
+    cpiR:"2.8",           // 소비자물가지수 % (SH: 5년평균 2.8%)
+    landRiseR:"3.1",      // 지가상승률 % (SH: 10년평균 3.1%)
+    priceMode:"nominal",  // "nominal"=불변가(현재가치기준) / "real"=경상가(물가반영)
+    totalOpYears:"40",    // 운영기간 포함 전체 사업기간 (년)
+    landResidualR:"100",  // 토지잔존가치율 % (사업종료 시 토지가의 %)
+  },
+  // ─── 재원조달 (5번) ───
+  funding:{
+    govGrantPerUnit:"0",      // 국고보조금 세대당 (천원) — 통합공공임대 등
+    govGrantApply:"N",        // 국고보조금 적용 Y/N
+    cityGrantAmt:"0",         // 시비지원금 (천원)
+    cityGrantApply:"N",       // 시비지원금 적용 Y/N
+    housingFundR:"60",        // 주택도시기금 비율 % (건축비 기준)
+    housingFundRate:"2.3",    // 주택도시기금 금리 % (장기전세 60이하 기준)
+    bondR:"30",               // 공사채 비율 % (TDC 기준)
+    bondRate:"2.76",          // 공사채 금리 % (SH 2025년 기준)
+    equityR:"10",             // 자체자금 비율 %
+    interestIncomeR:"1.0",    // 이자수익 % (SH제공)
   },
   aptActiveTab:"building",
 };
@@ -2160,17 +2193,42 @@ function calcAptCost(apt,area){
   // 총사업비 (금융 전)
   const tdc=baseCost+reserve;
 
+  // 수선유지비 (건축비의 maintR% × 운영기간)
+  const maintR=(+(c.maintR)||0.5)/100;
+  const operYears=+(c.operYears)||40;
+  const maint=directConstr*maintR*operYears; // 천원 (운영기간 총합)
+
   // 금융비용 (평균 잔액 기준 단순화)
   const period=+(c.constPeriod)||3;
   const loanR=+(c.loanR)||4.5;
   const finance=tdc*(loanR/100)*period/2;
 
   const tdcTotal=tdc+finance;
+  const tdcWithMaint=tdcTotal+maint;
+
+  // ── 재원조달 계산 (5번) ──
+  const fd=apt.funding||{};
+  const govGrant=(+(fd.govGrantApply)==="Y"||fd.govGrantApply==="Y")
+    ? area.totalUnits*(+(fd.govGrantPerUnit)||0) : 0;
+  const cityGrant=(fd.cityGrantApply==="Y") ? +(fd.cityGrantAmt)||0 : 0;
+  const totalGrant=govGrant+cityGrant;
+  // 기금·공사채: TDC 기준 비율
+  const housingFundAmt=tdc*(+(fd.housingFundR)||60)/100;
+  const bondAmt=tdc*(+(fd.bondR)||30)/100;
+  const equityAmt=tdc-housingFundAmt-bondAmt+totalGrant; // 자체자금(잔여)
+  // 연간 금융비용
+  const housingFundFinance=housingFundAmt*(+(fd.housingFundRate)||2.3)/100*period;
+  const bondFinance=bondAmt*(+(fd.bondRate)||2.76)/100*period;
+  const totalFinanceDetailed=housingFundFinance+bondFinance;
 
   return{
     land,aptA,aptB,nrA,pkA,directConstr,
     survey,design,designRate,superv,supervRate,facil,water,sewer,indirect,
     mgmt,sales,other,baseCost,reserve,tdc,finance,tdcTotal,
+    maint,maintR,operYears,tdcWithMaint,
+    govGrant,cityGrant,totalGrant,
+    housingFundAmt,bondAmt,equityAmt,
+    housingFundFinance,bondFinance,totalFinanceDetailed,
     corrI,baseI,period,loanR,
   };
 }
@@ -2180,19 +2238,36 @@ function calcAptRevenue(apt,area,cost){
   const{typeCalcs,nonResiCalcs}=area;
 
   // 타입별 수입
-  let aptSale=0, aptRentAnn=0;
+  let aptSale=0, aptRentAnn=0, aptJeonse2Conv=0;
   const typeRevs=typeCalcs.map(t=>{
     if(t.saleMode==="sale"){
       const inc=t.tSupply*(+(t.salePrice)||0); // 천원 (천원/㎡ × ㎡)
       aptSale+=inc;
-      return{...t, inc, annInc:0};
+      return{...t, inc, annInc:0, convInc:0};
+    } else if(t.saleMode==="jeonse2"){
+      // 전세2(분양전환형): 전세 운영 → 분양전환 수입
+      const dep=t.tExcl*(+(t.jeonse2Deposit)||0)/1000; // 천원 (보증금 총액)
+      const vacancy=(+(r.jeonse2VacancyR)||3)/100;
+      // 보증금 운용수익 (연간, 전환율 적용)
+      const depInc=dep*(+(r.convR)||4.5)/100*(1-vacancy);
+      aptRentAnn+=depInc;
+      // 분양전환 수입: 전환가격 입력 or 자동계산
+      let convPrice=+(t.jeonse2ConvPrice)||0;
+      if(!convPrice&&+(t.jeonse2Deposit)>0){
+        // 자동: 보증금/㎡ × 전환가율% / 전세가율% × 공급면적
+        convPrice=t.tSupply*(+(t.jeonse2Deposit)/((+(r.jeonseRate)||80)/100))*(+(t.jeonse2ConvRate)||100)/100;
+      }
+      aptJeonse2Conv+=convPrice;
+      return{...t, inc:0, annInc:depInc, dep, convInc:convPrice,
+             jeonse2ConvYear:+(t.jeonse2ConvYear)||20};
     } else {
+      // 임대(월세)
       const ann=t.tExcl*(+(t.rentUnit)||0)*12/1000; // 천원
       const dep=t.tExcl*(+(t.depositUnit)||0)/1000;
       const depInc=dep*(+(r.convR)||4.5)/100;
       const gi=(ann+depInc)*(1-(+(r.vacancyR)||5)/100);
       aptRentAnn+=gi;
-      return{...t, inc:0, annInc:gi, dep};
+      return{...t, inc:0, annInc:gi, dep, convInc:0};
     }
   });
 
@@ -2219,82 +2294,140 @@ function calcAptRevenue(apt,area,cost){
   if(pk.commercialSaleMode==="sale") pkInc=+(pk.commercialSaleIncome)||0;
   else if(pk.commercialSaleMode==="rent") pkInc=(+(pk.commercialRentIncome)||0)*12;
 
-  const totalSale=aptSale+nrSale;
+  const totalSale=aptSale+nrSale+aptJeonse2Conv; // 분양+전세2전환 합산
   const totalRentAnn=aptRentAnn+nrRentAnn;
-  const totalRevenue=totalSale+(pkInc); // 분양수입 합계 (임대는 별도)
+  const totalRevenue=totalSale+pkInc;
 
-  // 분양 스케줄 (천원)
-  const contractAmt=totalSale*(+(r.contractR)||10)/100;
-  const midAmt=totalSale*(+(r.midR)||50)/100;
-  const balanceAmt=totalSale*(+(r.balanceR)||40)/100;
+  // 분양 스케줄 (천원, 일반분양분)
+  const normalSale=aptSale+nrSale;
+  const contractAmt=normalSale*(+(r.contractR)||10)/100;
+  const midAmt=normalSale*(+(r.midR)||50)/100;
+  const balanceAmt=normalSale*(+(r.balanceR)||40)/100;
 
   return{
     typeRevs,nrRevs,
-    aptSale,aptRentAnn,nrSale,nrRentAnn,pkInc,
+    aptSale,aptRentAnn,nrSale,nrRentAnn,pkInc,aptJeonse2Conv,
     totalSale,totalRentAnn,totalRevenue,
-    contractAmt,midAmt,balanceAmt,
+    normalSale,contractAmt,midAmt,balanceAmt,
   };
 }
 
 function calcAptAnalysis(apt,cost,rev){
-  const dr=(+(apt.anlys.discountR)||4.5)/100;
-  const period=+(apt.cost.constPeriod)||3;
-  const{tdc,land,directConstr,indirect,other,reserve,loanR}=cost;
-  const{totalSale,contractAmt,midAmt,balanceAmt,pkInc,totalRentAnn}=rev;
+  const an=apt.anlys||{};
+  const dr=(+(an.discountR)||4.5)/100;
+  const gd=(+(an.gdpDeflator)||4.37)/100;  // GDP디플레이터 (경상가 변환)
+  const landRiseR=(+(an.landRiseR)||3.1)/100; // 지가상승률
+  const priceMode=an.priceMode||"nominal";   // "nominal"불변가 / "real"경상가
+  const isReal=priceMode==="real";
 
-  // 연도별 현금흐름 (Y=0~period)
-  const nonLandCost=directConstr+indirect+other+reserve; // 금융비용 제외
+  const constPeriod=+(apt.cost.constPeriod)||3;
+  const totalOpYears=+(an.totalOpYears)||40;
+  const totalYears=constPeriod+totalOpYears; // 전체 분석기간
+
+  const{tdc,land,directConstr,indirect,other,reserve,loanR,maint}=cost;
+  const{totalSale,normalSale,contractAmt,midAmt,balanceAmt,pkInc,
+        totalRentAnn,aptJeonse2Conv,typeRevs}=rev;
+
+  const rentRiseR=(+(apt.revenue?.rentRiseR)||3)/100; // 임대료 상승률
+  const maintPerYear=maint/(totalOpYears||40);         // 수선유지비 연간
+  const nonLandCost=directConstr+indirect+other+reserve;
+  const landResidualR=(+(an.landResidualR)||100)/100;
+
+  // ─── 경상가 변환 헬퍼 ───
+  // 불변가→경상가: value × (1+gdp)^y / (1+gdp)^baseY
+  // baseY = 0 (기준시점)
+  const toReal=(val,y)=>isReal?val*Math.pow(1+gd,y):val;
+
+  // ─── 연도별 현금흐름 구성 ───
   const cfs=[];
-  for(let y=0;y<=period;y++){
-    let out=0,inc=0;
+  for(let y=0;y<=totalYears;y++){
+    let out=0, inc=0;
+    let label="";
+
     if(y===0){
-      out=land;
-      inc=contractAmt;
-    } else if(y<period){
-      out=nonLandCost/period;
-      inc=midAmt/(period-1||1);
+      // Y=0: 토지비 지출 + 계약금 수입
+      out=toReal(land,y);
+      inc=toReal(contractAmt,y);
+      label="토지취득+계약금";
+    } else if(y<constPeriod){
+      // 건설기간(Y=1~constPeriod-1): 공사비 + 중도금
+      out=toReal(nonLandCost/constPeriod,y);
+      inc=toReal(midAmt/(constPeriod-1||1),y);
+      label=`공사(${y}년차)`;
+    } else if(y===constPeriod){
+      // 준공(Y=constPeriod): 공사비 마지막 + 잔금 + 분양수입
+      out=toReal(nonLandCost/constPeriod,y);
+      inc=toReal(balanceAmt+pkInc,y);
+      label="준공·잔금";
     } else {
-      out=0;
-      inc=balanceAmt+pkInc;
+      // 운영기간(Y=constPeriod+1 ~ totalYears): 임대료 + 수선유지비
+      const opY=y-constPeriod; // 운영 경과년
+      // 임대료 수입: 2년마다 3% 상승 적용
+      const riseMultiplier=Math.pow(1+rentRiseR, Math.floor((opY-1)/2));
+      const annRent=totalRentAnn*riseMultiplier;
+      inc=toReal(annRent,y);
+      out=toReal(maintPerYear,y); // 수선유지비 연간 지출
+      label=`운영${opY}년`;
+
+      // 전세2 분양전환 수입 — 해당 연도에 일시 발생
+      typeRevs.forEach(t=>{
+        if(t.saleMode==="jeonse2"&&t.convInc>0){
+          const convY=constPeriod+(+(t.jeonse2ConvYear)||20);
+          if(y===convY) inc+=toReal(t.convInc,y);
+        }
+      });
+
+      // 사업 마지막 해: 토지잔존가치
+      if(y===totalYears){
+        const landResidual=land*Math.pow(1+landRiseR,totalYears)*landResidualR;
+        inc+=toReal(landResidual,y);
+        label="사업종료·잔존가치";
+      }
     }
-    cfs.push({y, out, inc, net:inc-out});
+    cfs.push({y,out,inc,net:inc-out,label});
   }
 
-  // 연도별 금융비용 추가
-  let cumDebt=0;
-  cfs.forEach((cf,i)=>{
-    cumDebt+=cf.out-cf.inc;
-    cf.debt=Math.max(0,cumDebt);
-    cf.fin=i>0?cf.debt*(loanR/100):0;
-    cf.netFin=cf.net-cf.fin;
-  });
-
   const cfNets=cfs.map(c=>c.net);
-  const cfNetsFin=cfs.map(c=>c.netFin);
 
-  // NPV / IRR (세전, 금융비용 제외)
+  // NPV / IRR
   const NPV=calcNPV(cfNets,dr);
   const IRR=calcIRR(cfNets);
 
-  // NPV (금융비용 포함)
-  const NPVfin=calcNPV(cfNetsFin,dr);
-
   // 수익성지수 PI
   let pvOut=0,pvInc=0;
-  cfs.forEach((cf,y)=>{ pvOut+=cf.out/(1+dr)**y; pvInc+=cf.inc/(1+dr)**y; });
+  cfs.forEach((cf,y)=>{
+    pvOut+=cf.out/(1+dr)**y;
+    pvInc+=cf.inc/(1+dr)**y;
+  });
   const PI=pvOut>0?pvInc/pvOut:0;
 
-  // 단순 지표
-  const profit=totalSale-tdc;
-  const profitR=tdc>0?profit/tdc*100:0;
-  const totalCostIncFin=tdc+cost.finance;
-  const profitRFin=totalCostIncFin>0?(totalSale-totalCostIncFin)/totalCostIncFin*100:0;
+  // 누적 현금흐름 (손익분기점 확인용)
+  let cumNet=0;
+  let bepYear=null;
+  cfs.forEach((cf,i)=>{
+    cumNet+=cf.net;
+    if(bepYear===null&&cumNet>=0) bepYear=cf.y;
+    cf.cumNet=cumNet;
+    cf.pv=cf.net/(1+dr)**cf.y;
+  });
+
+  // 건설기간만 단순 지표
+  const constCFs=cfs.slice(0,constPeriod+1);
+  const constNPV=calcNPV(constCFs.map(c=>c.net),dr);
+
+  // 총수입·총비용 (현재가치)
+  const totalRevPV=pvInc;
+  const totalCostPV=pvOut;
+  const profit=totalRevPV-totalCostPV;
+  const profitR=totalCostPV>0?profit/totalCostPV*100:0;
 
   return{
-    cfs,NPV,IRR:IRR!==null?IRR*100:null,NPVfin,PI,
-    pvOut,pvInc,profit,profitR,profitRFin,
-    totalRevenue:totalSale,period,dr,
-    totalRentAnn,
+    cfs,NPV,IRR:IRR!==null?IRR*100:null,PI,
+    pvOut,pvInc,profit,profitR,constNPV,
+    totalRevenue:totalSale+totalRentAnn*totalOpYears,
+    period:constPeriod,totalYears,dr,priceMode,isReal,
+    totalRentAnn,bepYear,
+    constPeriod,totalOpYears,
   };
 }
 
@@ -2319,6 +2452,27 @@ function aptReducer(state,{type,p}){
     case"APT_DEL_NR":  return{...state,nonResi:state.nonResi.filter(r=>r.id!==p.id)};
     case"APT_NR":      return upNR(r=>({...r,[p.k]:p.v}));
     case"APT_RESET_TYPES":return{...state,types:DEFAULT_APT_TYPES.map(t=>({...t,id:auid()}))};
+    case"APT_SH_PRESET": return{...state,
+      cost:{...state.cost,
+        mgmtR:"5.62", salesR:"0.38", directLaborR:"2.0",
+        reserveR:"10.0", loanR:"2.76", maintR:"0.5", operYears:"40",
+      },
+      revenue:{...state.revenue,
+        convR:"4.5", vacancyR:"3", jeonse2VacancyR:"3",
+        rentRiseR:"3.0", jeonseRate:"80",
+      },
+      anlys:{...state.anlys,
+        discountR:"4.5", gdpDeflator:"4.37", cpiR:"2.8", landRiseR:"3.1",
+        totalOpYears:"40",
+      },
+      funding:{...state.funding,
+        housingFundRate:"2.3", bondRate:"2.76", interestIncomeR:"1.0",
+        govGrantApply:"N", cityGrantApply:"N",
+        housingFundR:"60", bondR:"30", equityR:"10",
+      },
+    };
+    case"APT_FUNDING":  return{...state,funding:{...state.funding,...p}};
+    case"APT_ANLYS_MODE": return{...state,anlys:{...state.anlys,priceMode:p}};
     default: return state;
   }
 }
@@ -2458,7 +2612,7 @@ function AptBuildingTab({apt,dispatch,area,onEum}){
                     <td style={{...aTd(),fontFamily:C.mono,fontSize:"11px",fontWeight:700,textAlign:"right",color:C.teal}}>{t.contract.toFixed(2)}</td>
                     <td style={aTd()}>
                       <select value={orig.saleMode} onChange={e=>D("APT_TYPE",{id:t.id,k:"saleMode",v:e.target.value})} style={{fontSize:"10px",padding:"2px 4px",border:`1px solid ${C.border}`,borderRadius:"4px",fontFamily:C.sans,background:"#fff"}}>
-                        <option value="sale">분양</option><option value="rent">임대</option>
+                        <option value="sale">분양</option><option value="rent">임대(월세)</option><option value="jeonse2">전세2(분양전환)</option>
                       </select>
                     </td>
                     <td style={aTd()}>
@@ -2721,6 +2875,23 @@ function AptCostTab({apt,dispatch,area,cost,onEum}){
         </G>
       </Card>
 
+      {/* 수선유지비 (SH 재무성분석) */}
+      <Card title="수선유지비 (운영기간)" tag="MAINTENANCE COST" accentBar={C.teal} collapsible>
+        <div style={{marginBottom:"8px",padding:"7px 11px",background:C.tealBg,border:`1px solid ${C.teal}30`,borderRadius:"7px",fontSize:"10px",color:C.teal,lineHeight:1.7}}>
+          <ModeTag label="SH 재무성분석 항목" color={C.teal}/> 운영기간 동안 발생하는 수선유지비. 건축비(직접공사비) 기준 요율 × 운영년수 합산.
+          SH기준: 0.5%/년 × 40년 = 건축비의 20% 수준
+        </div>
+        <G cols="repeat(auto-fit,minmax(150px,1fr))">
+          <AInput label="수선유지비율 (건축비/년)" value={c.maintR} onChange={v=>D("APT_COST",{maintR:v})} unit="%" lawNote="SH기준 0.5%"/>
+          <AInput label="운영기간" value={c.operYears} onChange={v=>D("APT_COST",{operYears:v})} unit="년" lawNote="SH: 40년"/>
+          <KpiCard label="수선유지비 합계" value={fM(cc.maint*1000)} unit="" ok2 sub={`건축비 ${fM(cc.directConstr*1000)} × ${c.maintR}% × ${c.operYears}년`}/>
+          <KpiCard label="TDC+수선유지비 합계" value={fM(cc.tdcWithMaint*1000)} unit="" hi sub="금융비용+수선유지비 포함"/>
+        </G>
+        <div style={{marginTop:"8px",padding:"7px 11px",background:C.cardAlt,borderRadius:"7px",fontSize:"9px",color:C.muted}}>
+          * 수선유지비는 TDC와 별도로 운영기간 중 지출되는 비용입니다. 사업성 분석에서 운영기간 현금흐름에 반영됩니다 (4~6단계 구현 예정).
+        </div>
+      </Card>
+
       {/* TDC 요약 */}
       <div style={{background:"#fff",border:`2px solid ${C.amber}30`,borderRadius:"12px",padding:"16px 18px",boxShadow:C.shadowMd}}>
         <div style={{display:"flex",flexWrap:"wrap",gap:"20px",alignItems:"flex-start"}}>
@@ -2775,22 +2946,40 @@ function AptRevenueTab({apt,dispatch,area,rev}){
                     <td style={{padding:"5px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"11px",color:C.green,fontWeight:600,borderRight:`1px solid ${C.border}`}}>{t.tSupply.toFixed(1)}</td>
                     <td style={{padding:"5px 8px",borderRight:`1px solid ${C.border}`}}>
                       <select value={orig.saleMode||"sale"} onChange={e=>D("APT_TYPE",{id:t.id,k:"saleMode",v:e.target.value})} style={{fontSize:"10px",padding:"2px 4px",border:`1px solid ${C.border}`,borderRadius:"4px",fontFamily:C.sans,background:"#fff"}}>
-                        <option value="sale">분양</option><option value="rent">임대</option>
+                        <option value="sale">분양</option><option value="rent">임대(월세)</option><option value="jeonse2">전세2(분양전환)</option>
                       </select>
                     </td>
                     <td style={{padding:"5px 8px",textAlign:"right",borderRight:`1px solid ${C.border}`}}>
-                      <input value={isSale?(orig.salePrice||""):(orig.rentUnit||"")} onChange={e=>D("APT_TYPE",{id:t.id,k:isSale?"salePrice":"rentUnit",v:e.target.value})} placeholder={isSale?"천원/㎡(공급)":"원/㎡/월"} style={aInpS(80)}/>
-                      <div style={{fontSize:"8px",color:C.muted,textAlign:"right"}}>{isSale?"천원/공급㎡":"원/전용㎡/월"}</div>
+                      {isSale
+                        ?<><input value={orig.salePrice||""} onChange={e=>D("APT_TYPE",{id:t.id,k:"salePrice",v:e.target.value})} placeholder="천원/공급㎡" style={aInpS(80)}/><div style={{fontSize:"8px",color:C.muted}}>천원/공급㎡</div></>
+                        :t.saleMode==="jeonse2"
+                          ?<><input value={orig.jeonse2Deposit||""} onChange={e=>D("APT_TYPE",{id:t.id,k:"jeonse2Deposit",v:e.target.value})} placeholder="원/전용㎡" style={aInpS(80)}/><div style={{fontSize:"8px",color:"#7c3aed"}}>전세보증금 원/전용㎡</div></>
+                          :<><input value={orig.rentUnit||""} onChange={e=>D("APT_TYPE",{id:t.id,k:"rentUnit",v:e.target.value})} placeholder="원/㎡/월" style={aInpS(80)}/><div style={{fontSize:"8px",color:C.muted}}>원/전용㎡/월</div></>
+                      }
                     </td>
                     <td style={{padding:"5px 8px",textAlign:"right",borderRight:`1px solid ${C.border}`}}>
-                      {!isSale&&<input value={orig.depositUnit||""} onChange={e=>D("APT_TYPE",{id:t.id,k:"depositUnit",v:e.target.value})} placeholder="원/㎡" style={aInpS(75)}/>}
                       {isSale&&<span style={{fontSize:"10px",color:C.muted}}>—</span>}
+                      {!isSale&&t.saleMode==="jeonse2"&&(
+                        <div>
+                          <input value={orig.jeonse2ConvYear||"20"} onChange={e=>D("APT_TYPE",{id:t.id,k:"jeonse2ConvYear",v:e.target.value})} style={aInpS(38)} placeholder="20"/>
+                          <div style={{fontSize:"8px",color:"#7c3aed"}}>전환(년)</div>
+                        </div>
+                      )}
+                      {!isSale&&t.saleMode!=="jeonse2"&&<input value={orig.depositUnit||""} onChange={e=>D("APT_TYPE",{id:t.id,k:"depositUnit",v:e.target.value})} placeholder="원/㎡" style={aInpS(75)}/>}
                     </td>
-                    <td style={{padding:"5px 10px",textAlign:"right",fontFamily:C.mono,fontSize:"12px",color:C.green,fontWeight:700,borderRight:`1px solid ${C.border}`}}>
-                      {isSale?fM(t.inc*1000):fM(t.annInc*1000)}
-                      <div style={{fontSize:"9px",color:C.muted,fontWeight:400}}>{isSale?"분양":"연임대"}</div>
+                    <td style={{padding:"5px 10px",textAlign:"right",fontFamily:C.mono,fontSize:"12px",color:t.saleMode==="jeonse2"?"#7c3aed":C.green,fontWeight:700,borderRight:`1px solid ${C.border}`}}>
+                      {isSale&&<>{fM(t.inc*1000)}<div style={{fontSize:"9px",color:C.muted,fontWeight:400}}>분양수입</div></>}
+                      {!isSale&&t.saleMode==="jeonse2"&&<>
+                        <div>{fM(t.convInc*1000)}</div>
+                        <div style={{fontSize:"9px",color:C.muted,fontWeight:400}}>전환({orig.jeonse2ConvYear||20}년후)+보증금운용 {fM(t.annInc*1000)}/년</div>
+                      </>}
+                      {!isSale&&t.saleMode!=="jeonse2"&&<>{fM(t.annInc*1000)}<div style={{fontSize:"9px",color:C.muted,fontWeight:400}}>연임대수입</div></>}
                     </td>
-                    <td style={{padding:"5px 9px",fontSize:"9px",color:C.muted}}>{isSale?`공급면적 기준`:`전용기준 연${(+((orig.rentUnit||0))*12/10000).toFixed(0)}만원/㎡`}</td>
+                    <td style={{padding:"5px 9px",fontSize:"9px",color:C.muted}}>
+                      {isSale&&"공급면적 기준"}
+                      {!isSale&&t.saleMode==="jeonse2"&&<><span style={{color:"#7c3aed",fontWeight:600}}>전세2</span> 분양전환율 <input value={orig.jeonse2ConvRate||"100"} onChange={e=>D("APT_TYPE",{id:t.id,k:"jeonse2ConvRate",v:e.target.value})} style={{width:"35px",border:`1px solid #7c3aed50`,borderRadius:"3px",fontSize:"9px",textAlign:"right",fontFamily:C.mono}} placeholder="100"/>%</>}
+                      {!isSale&&t.saleMode!=="jeonse2"&&`전용기준 연${(+((orig.rentUnit||0))*12/10000).toFixed(0)}만원/㎡`}
+                    </td>
                   </tr>
                 );
               })}
@@ -2909,7 +3098,7 @@ function AptRevenueTab({apt,dispatch,area,rev}){
             </div>
           )}
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"5px 16px"}}>
-            {[["공동주택 분양",rev.aptSale],["비주거 분양",rev.nrSale],["공영주차장",rev.pkInc]].filter(([,v])=>v>0).map(([l,v])=>(
+            {[["공동주택 분양",rev.aptSale],["전세2 분양전환",rev.aptJeonse2Conv||0],["비주거 분양",rev.nrSale],["공영주차장",rev.pkInc]].filter(([,v])=>v>0).map(([l,v])=>(
               <div key={l}><span style={{fontSize:"10px",color:C.muted}}>{l}: </span><span style={{fontSize:"12px",fontFamily:C.mono,fontWeight:600,color:C.green}}>{fM(v*1000)}</span></div>
             ))}
           </div>
@@ -2919,18 +3108,165 @@ function AptRevenueTab({apt,dispatch,area,rev}){
   );
 }
 
+
+// ════════════════════════════════════════════════════════════════
+// § APT-9B. 재원조달 탭 (5번)
+// ════════════════════════════════════════════════════════════════
+function AptFundingTab({apt,dispatch,cost,area}){
+  const D=(t,p)=>dispatch({type:t,p});
+  const fd=apt.funding||{};
+  const c=cost;
+  const thS={padding:"7px 10px",fontSize:"10px",color:C.muted,fontWeight:700,textAlign:"left",background:C.cardAlt,borderBottom:`1px solid ${C.border}`};
+  const tdS={padding:"6px 10px",fontSize:"11px",borderBottom:`1px solid ${C.faint}`};
+
+  // 재원 비율 합계 검증
+  const sumR=(+(fd.housingFundR)||0)+(+(fd.bondR)||0)+(+(fd.equityR)||0);
+
+  return(
+    <div>
+      <div style={{padding:"9px 13px",background:"#f0fdf4",border:`1px solid ${C.green}30`,borderRadius:"9px",marginBottom:"14px",fontSize:"11px",color:C.green,lineHeight:1.7}}>
+        <strong>🏦 재원조달 구조:</strong> SH 재무성분석 기준 — 주택도시기금 + 공사채 + 자체자금 + 국고보조금/시비지원금으로 구성
+      </div>
+
+      {/* 국고보조금·시비지원금 */}
+      <Card title="국고보조금 · 시비지원금" tag="GOVERNMENT SUBSIDY" accentBar={C.accent}>
+        <div style={{marginBottom:"9px",padding:"7px 11px",background:C.accentBg,border:`1px solid ${C.accent}30`,borderRadius:"7px",fontSize:"10px",color:C.accent,lineHeight:1.7}}>
+          <ModeTag label="공공주택 특별법 제2조, 제3조의2" color={C.accent}/> 통합공공임대 해당 시 국고보조금 지원. 세대수 × 유형별 단가.
+        </div>
+        <G cols="repeat(auto-fit,minmax(160px,1fr))">
+          <div>
+            <div style={{fontSize:"11px",color:C.muted,marginBottom:"4px",fontWeight:600}}>국고보조금 적용 여부</div>
+            <div style={{display:"flex",gap:"6px"}}>
+              {[["Y","적용"],["N","해당없음"]].map(([v,l])=>(
+                <button key={v} onClick={()=>D("APT_FUNDING",{govGrantApply:v})}
+                  style={{padding:"5px 12px",borderRadius:"6px",border:`1.5px solid ${fd.govGrantApply===v?C.accent:C.border}`,background:fd.govGrantApply===v?C.accentBg:"#fff",color:fd.govGrantApply===v?C.accent:C.muted,fontSize:"11px",fontWeight:600,cursor:"pointer",fontFamily:C.sans}}>
+                  {l}
+                </button>
+              ))}
+            </div>
+          </div>
+          {fd.govGrantApply==="Y"&&<>
+            <AInput label="국고보조금 (세대당)" value={fd.govGrantPerUnit} onChange={v=>D("APT_FUNDING",{govGrantPerUnit:v})} unit="천원/세대" lawNote="통합공공임대 기준"/>
+            <KpiCard label="국고보조금 합계" value={fM(c.govGrant*1000)} unit="" ok2 sub={`${area.totalUnits}세대 × ${fM(+(fd.govGrantPerUnit)*1000)}원`}/>
+          </>}
+        </G>
+        <div style={{marginTop:"10px",padding:"10px 13px",background:C.cardAlt,borderRadius:"8px"}}>
+          <G cols="repeat(auto-fit,minmax(160px,1fr))">
+            <div>
+              <div style={{fontSize:"11px",color:C.muted,marginBottom:"4px",fontWeight:600}}>시비지원금 적용 여부</div>
+              <div style={{display:"flex",gap:"6px"}}>
+                {[["Y","적용"],["N","해당없음"]].map(([v,l])=>(
+                  <button key={v} onClick={()=>D("APT_FUNDING",{cityGrantApply:v})}
+                    style={{padding:"5px 12px",borderRadius:"6px",border:`1.5px solid ${fd.cityGrantApply===v?C.teal:C.border}`,background:fd.cityGrantApply===v?C.tealBg:"#fff",color:fd.cityGrantApply===v?C.teal:C.muted,fontSize:"11px",fontWeight:600,cursor:"pointer",fontFamily:C.sans}}>
+                    {l}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {fd.cityGrantApply==="Y"&&<>
+              <AInput label="서울시비 지원금" value={fd.cityGrantAmt} onChange={v=>D("APT_FUNDING",{cityGrantAmt:v})} unit="천원" lawNote="min(공사비, 국고보조금)"/>
+              <KpiCard label="시비지원금 합계" value={fM(+(fd.cityGrantAmt)*1000)} unit="" ok2/>
+            </>}
+          </G>
+        </div>
+      </Card>
+
+      {/* 주택도시기금 */}
+      <Card title="주택도시기금" tag="HOUSING URBAN FUND" accentBar={C.green}>
+        <div style={{marginBottom:"8px",padding:"7px 11px",background:C.greenBg,border:`1px solid ${C.green}30`,borderRadius:"7px",fontSize:"10px",color:C.green,lineHeight:1.7}}>
+          장기전세 60이하 2.3% / 60초과 2.8% (국토교통부). 건축비 기준 비율 적용.
+        </div>
+        <G cols="repeat(auto-fit,minmax(150px,1fr))">
+          <AInput label="기금 조달 비율 (TDC기준)" value={fd.housingFundR} onChange={v=>D("APT_FUNDING",{housingFundR:v})} unit="%" lawNote="SH: 약 60%"/>
+          <AInput label="주택도시기금 금리" value={fd.housingFundRate} onChange={v=>D("APT_FUNDING",{housingFundRate:v})} unit="%" lawNote="장기전세 60이하"/>
+          <KpiCard label="기금 조달액" value={fM(c.housingFundAmt*1000)} unit="" ok2 sub={`TDC ${fM(c.tdc*1000)} × ${fd.housingFundR}%`}/>
+          <KpiCard label="기금 이자 (공사기간)" value={fM(c.housingFundFinance*1000)} unit="" sub={`${fd.housingFundRate}% × ${apt.cost.constPeriod}년`}/>
+        </G>
+      </Card>
+
+      {/* 공사채 */}
+      <Card title="SH 공사채" tag="CORPORATION BOND" accentBar={C.amber}>
+        <div style={{marginBottom:"8px",padding:"7px 11px",background:C.amberBg,border:`1px solid ${C.amber}30`,borderRadius:"7px",fontSize:"10px",color:C.amber,lineHeight:1.7}}>
+          SH공사채 발행 이자율 2.76% (SH제공, 2025년 기준). TDC 기준 비율 적용.
+        </div>
+        <G cols="repeat(auto-fit,minmax(150px,1fr))">
+          <AInput label="공사채 조달 비율 (TDC기준)" value={fd.bondR} onChange={v=>D("APT_FUNDING",{bondR:v})} unit="%" lawNote="SH: 약 30%"/>
+          <AInput label="공사채 금리" value={fd.bondRate} onChange={v=>D("APT_FUNDING",{bondRate:v})} unit="%" lawNote="SH 2025년 2.76%"/>
+          <KpiCard label="공사채 조달액" value={fM(c.bondAmt*1000)} unit="" hi sub={`TDC × ${fd.bondR}%`}/>
+          <KpiCard label="공사채 이자 (공사기간)" value={fM(c.bondFinance*1000)} unit="" sub={`${fd.bondRate}% × ${apt.cost.constPeriod}년`}/>
+        </G>
+      </Card>
+
+      {/* 자체자금 + 재원 요약 */}
+      <Card title="자체자금 · 재원 총괄" tag="EQUITY & SUMMARY" accentBar={C.mid}>
+        <G cols="repeat(auto-fit,minmax(150px,1fr))">
+          <AInput label="자체자금 비율" value={fd.equityR} onChange={v=>D("APT_FUNDING",{equityR:v})} unit="%"/>
+          <AInput label="이자수익률" value={fd.interestIncomeR} onChange={v=>D("APT_FUNDING",{interestIncomeR:v})} unit="%" lawNote="SH: 1.0%"/>
+          <KpiCard label="자체자금 (잔여)" value={fM(c.equityAmt*1000)} unit="" sub="TDC − 기금 − 공사채 + 보조금"/>
+          <KpiCard label="총 보조금" value={fM(c.totalGrant*1000)} unit="" ok2={c.totalGrant>0}/>
+        </G>
+        {Math.abs(sumR-100)>0.5&&(
+          <div style={{marginTop:"8px",padding:"6px 11px",background:C.redBg,borderRadius:"6px",fontSize:"10px",color:C.red}}>
+            ⚠ 재원비율 합계 = {sumR.toFixed(1)}% — 100%가 되도록 조정해 주세요 (기금+공사채+자체자금)
+          </div>
+        )}
+        {/* 재원조달 총괄표 */}
+        <div style={{marginTop:"12px",border:`1.5px solid ${C.border}`,borderRadius:"9px",overflow:"hidden"}}>
+          <div style={{padding:"7px 12px",background:C.cardAlt,fontSize:"11px",fontWeight:700,color:C.mid}}>재원조달 총괄 (불변가 기준)</div>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead>
+              <tr style={{background:C.cardAlt}}>
+                {["구분","금액","비율","금리","공사기간 이자"].map((h,i)=>(
+                  <th key={i} style={{padding:"7px 10px",fontSize:"10px",color:C.muted,fontWeight:700,textAlign:i===0?"left":"right",borderTop:`1px solid ${C.border}`,borderBottom:`1px solid ${C.border}`}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {[
+                ["주택도시기금",c.housingFundAmt,c.tdc>0?c.housingFundAmt/c.tdc*100:0,fd.housingFundRate+"%",c.housingFundFinance],
+                ["SH공사채",c.bondAmt,c.tdc>0?c.bondAmt/c.tdc*100:0,fd.bondRate+"%",c.bondFinance],
+                ["자체자금",c.equityAmt,c.tdc>0?c.equityAmt/c.tdc*100:0,"—",0],
+                ["국고보조금",c.govGrant,c.tdc>0?c.govGrant/c.tdc*100:0,"지원","—"],
+                ["서울시비",c.cityGrant,c.tdc>0?c.cityGrant/c.tdc*100:0,"지원","—"],
+              ].map(([l,amt,pct,rate,fin],i)=>(
+                <tr key={l} style={{borderBottom:`1px solid ${C.faint}`,background:i%2?C.cardAlt:"#fff"}}>
+                  <td style={{padding:"6px 10px",fontSize:"11px",fontWeight:600}}>{l}</td>
+                  <td style={{padding:"6px 10px",textAlign:"right",fontFamily:C.mono,fontSize:"11px"}}>{typeof amt==="number"?fM(amt*1000):"—"}</td>
+                  <td style={{padding:"6px 10px",textAlign:"right",fontFamily:C.mono,fontSize:"11px",color:C.muted}}>{typeof pct==="number"?fP(pct)+"%":"—"}</td>
+                  <td style={{padding:"6px 10px",textAlign:"right",fontFamily:C.mono,fontSize:"11px"}}>{rate}</td>
+                  <td style={{padding:"6px 10px",textAlign:"right",fontFamily:C.mono,fontSize:"11px",color:C.amber}}>{typeof fin==="number"&&fin>0?fM(fin*1000):"—"}</td>
+                </tr>
+              ))}
+              <tr style={{background:"#f1f5f9",borderTop:`2px solid ${C.mid}30`}}>
+                <td style={{padding:"7px 10px",fontWeight:700}}>합계 (TDC)</td>
+                <td style={{padding:"7px 10px",textAlign:"right",fontFamily:C.mono,fontWeight:700,color:C.amber}}>{fM(c.tdc*1000)}</td>
+                <td style={{padding:"7px 10px",textAlign:"right",fontFamily:C.mono,fontWeight:700}}>100%</td>
+                <td/>
+                <td style={{padding:"7px 10px",textAlign:"right",fontFamily:C.mono,fontWeight:700,color:C.amber}}>{fM((c.housingFundFinance+c.bondFinance)*1000)}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
 // ════════════════════════════════════════════════════════════════
 // § APT-9. 사업성 분석 탭
 // ════════════════════════════════════════════════════════════════
 function AptAnalysisTab({apt,dispatch,cost,rev,ana}){
   const D=(t,p)=>dispatch({type:t,p});
+  const[showAllYears,setShowAllYears]=useState(false); // 전체기간 표시 토글
   const startY=+(apt.cost.startYear)||2025;
-  const period=+(apt.cost.constPeriod)||3;
+  const constPeriod=+(apt.cost.constPeriod)||3;
+  const totalYears=ana?.totalYears||constPeriod;
   const thS={padding:"7px 9px",fontSize:"10px",color:C.muted,fontWeight:700,borderRight:`1px solid ${C.border}`,whiteSpace:"nowrap"};
+  const isReal=apt.anlys?.priceMode==="real";
 
-  if(!ana||rev.totalSale===0)return(
+  if(!ana)return(
     <div style={{textAlign:"center",padding:"48px 20px",color:C.muted,fontSize:"13px",background:C.card,borderRadius:"12px",border:`1.5px solid ${C.border}`,lineHeight:2}}>
-      면적·사업비·분양수입 데이터를 모두 입력하면 자동으로 분석됩니다.
+      면적·사업비 데이터를 입력하면 자동으로 분석됩니다.
     </div>
   );
 
@@ -2938,11 +3274,30 @@ function AptAnalysisTab({apt,dispatch,cost,rev,ana}){
     <div>
       {/* 분석 파라미터 */}
       <Card title="분석 파라미터" tag="PARAMETERS">
+        {/* 불변가/경상가 토글 (4번) */}
+        <div style={{display:"flex",alignItems:"center",gap:"10px",marginBottom:"12px",padding:"9px 13px",background:isReal?"#fef3c7":"#f0f9ff",border:`1.5px solid ${isReal?C.amber:"#0ea5e9"}`,borderRadius:"8px"}}>
+          <span style={{fontSize:"11px",fontWeight:700,color:isReal?C.amber:"#0369a1"}}>
+            {isReal?"📈 경상가 모드 (물가상승 반영)":"📊 불변가 모드 (현재가치 기준)"}
+          </span>
+          <div style={{display:"flex",gap:"6px",marginLeft:"auto"}}>
+            {[["nominal","불변가 (기준)"],["real","경상가 (GDP디플레이터 반영)"]].map(([v,l])=>(
+              <button key={v} onClick={()=>D("APT_ANLYS",{priceMode:v})}
+                style={{padding:"4px 12px",borderRadius:"6px",border:`1.5px solid ${apt.anlys?.priceMode===v?(isReal?C.amber:"#0284c7"):C.border}`,background:apt.anlys?.priceMode===v?(isReal?"#fef3c7":"#e0f2fe"):"#fff",color:apt.anlys?.priceMode===v?(isReal?C.amber:"#0284c7"):C.muted,fontSize:"10px",fontWeight:600,cursor:"pointer",fontFamily:C.sans}}>
+                {l}
+              </button>
+            ))}
+          </div>
+          {isReal&&<span style={{fontSize:"9px",color:C.amber}}>GDP디플레이터 {apt.anlys?.gdpDeflator||"4.37"}% 적용</span>}
+        </div>
         <G cols="repeat(auto-fit,minmax(140px,1fr))">
-          <AInput label="할인율" value={apt.anlys.discountR} onChange={v=>D("APT_ANLYS",{discountR:v})} unit="%" lawNote="통상 사업금리 수준"/>
-          <KpiCard label="공사기간" value={`${period}년`} unit="" sub="사업비탭에서 설정"/>
-          <KpiCard label="총 사업비" value={fM(cost.tdcTotal*1000)} unit=""/>
-          <KpiCard label="총 분양수입" value={fM(rev.totalSale*1000)} unit="" ok2={rev.totalSale>cost.tdcTotal}/>
+          <AInput label="할인율" value={apt.anlys?.discountR||"4.5"} onChange={v=>D("APT_ANLYS",{discountR:v})} unit="%" lawNote="KDI: 4.5%"/>
+          {isReal&&<AInput label="GDP디플레이터" value={apt.anlys?.gdpDeflator||"4.37"} onChange={v=>D("APT_ANLYS",{gdpDeflator:v})} unit="%" lawNote="SH:4.37%"/>}
+          <AInput label="전체 분석기간" value={apt.anlys?.totalOpYears||"40"} onChange={v=>D("APT_ANLYS",{totalOpYears:v})} unit="년" lawNote="운영기간 포함"/>
+          <AInput label="토지잔존가치율" value={apt.anlys?.landResidualR||"100"} onChange={v=>D("APT_ANLYS",{landResidualR:v})} unit="%" lawNote="사업종료 토지가"/>
+          <KpiCard label="공사기간" value={`${constPeriod}년`} unit="" sub="사업비탭에서 설정"/>
+          <KpiCard label="총사업비(TDC)" value={fM(cost.tdcTotal*1000)} unit=""/>
+          <KpiCard label="총 분양수입" value={fM(rev.totalSale*1000)} unit="" ok2={rev.totalSale>cost.tdc}/>
+          {ana.totalRentAnn>0&&<KpiCard label="연간 임대수입" value={fM(ana.totalRentAnn*1000)} unit="" sub="임대+전세2보증금운용"/>}
         </G>
       </Card>
 
@@ -2967,40 +3322,66 @@ function AptAnalysisTab({apt,dispatch,cost,rev,ana}){
             <div style={{fontFamily:C.mono,fontSize:"19px",color:ana.PI>=1?C.green:C.red,fontWeight:700}}>{fP(ana.PI,2)}</div>
             <div style={{fontSize:"9px",color:ana.PI>=1.05?C.green:ana.PI>=1?C.amber:C.red,marginTop:"4px"}}>{ana.PI>=1.05?"✓ 우수":ana.PI>=1?"△ 타당":"✗ 미달"}<span style={{color:C.muted}}> (1.0 기준)</span></div>
           </div>
-          {/* 사업 수지 */}
+          {/* 수익성지수 PV기반 수익 */}
           <div style={{background:"#fff",border:`1.5px solid ${C.border}`,borderRadius:"9px",padding:"12px 14px"}}>
-            <div style={{fontSize:"10px",color:C.muted,fontWeight:600,marginBottom:"5px"}}>개발이익 (금융전)</div>
+            <div style={{fontSize:"10px",color:C.muted,fontWeight:600,marginBottom:"5px"}}>현재가치 기준 수익 (PV)</div>
             <div style={{fontFamily:C.mono,fontSize:"19px",color:ana.profit>0?C.green:C.red,fontWeight:700}}>{fM(ana.profit*1000)}</div>
-            <div style={{fontSize:"9px",color:C.muted,marginTop:"4px"}}>수익률: {fP(ana.profitR)}%</div>
+            <div style={{fontSize:"9px",color:C.muted,marginTop:"4px"}}>수익률(PV): {fP(ana.profitR)}% | BEP: {ana.bepYear!==null?`${ana.bepYear}년차`:"미도달"}</div>
           </div>
         </G>
+        <div style={{marginTop:"9px",padding:"8px 12px",background:isReal?"#fef3c7":"#f0f9ff",borderRadius:"7px",fontSize:"10px",color:isReal?C.amber:"#0369a1"}}>
+          {isReal?"📈 경상가(물가상승 반영) 기준 — 비용·수입에 GDP디플레이터 누적 적용":"📊 불변가(현재가치) 기준 — 모든 현금흐름을 기준시점 가치로 환산"}
+          {" | 할인율 "}{apt.anlys?.discountR||4.5}{"% 적용 | 전체 분석기간 "}{ana.totalYears}{"년"}
+        </div>
       </Card>
 
-      {/* 연도별 현금흐름 */}
-      <Card title="연도별 현금흐름 (단순화)" tag="ANNUAL CASH FLOW">
+      {/* 연도별 현금흐름 — 운영기간 포함 전체 (6번) */}
+      <Card title="연도별 현금흐름 (전체 사업기간)" tag="ANNUAL CASH FLOW — FULL PERIOD">
         <div style={{marginBottom:"9px",padding:"7px 11px",background:C.cardAlt,borderRadius:"7px",fontSize:"10px",color:C.muted,lineHeight:1.7}}>
-          0년차: 토지비 지출 + 계약금 수입 | 1~{period-1}년차: 공사비 지출 + 중도금 수입 | {period}년차: 잔금 수입 + 공영주차장 수입
+          건설기간({constPeriod}년) + 운영기간({apt.anlys?.totalOpYears||40}년) = 전체 {ana.totalYears}년 현금흐름.
+          {isReal?" 경상가(GDP디플레이터 누적) 적용.":" 불변가(현재가치 기준) 적용."}
+          임대료 {apt.revenue?.rentRiseR||3}%/2년 상승 반영.
+        </div>
+        <div style={{display:"flex",justifyContent:"flex-end",marginBottom:"8px"}}>
+          <button onClick={()=>setShowAllYears(!showAllYears)} style={{padding:"4px 12px",borderRadius:"6px",border:`1.5px solid ${C.accent}`,background:showAllYears?C.accentBg:"#fff",color:C.accent,fontSize:"11px",cursor:"pointer",fontFamily:C.sans,fontWeight:600}}>
+            {showAllYears?"▲ 주요 연도만 보기":"▼ 전체 연도 보기"}
+          </button>
         </div>
         <div style={{overflowX:"auto",border:`1.5px solid ${C.border}`,borderRadius:"8px"}}>
           <table style={{width:"100%",borderCollapse:"collapse",minWidth:"550px"}}>
             <thead>
               <tr style={{background:C.cardAlt}}>
-                {["연도","현금지출","현금유입","순현금흐름","누적 CF","할인 PV","누적 NPV"].map((h,i)=>(
+                {["연도(구분)","현금지출","현금유입","순현금흐름","누적 CF","할인 PV"].map((h,i)=>(
                   <th key={i} style={{...thS,textAlign:i===0?"left":"right"}}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {ana.cfs.map((cf,y)=>{
+              {(showAllYears?ana.cfs:ana.cfs.filter((cf,y)=>{
+                // 주요 연도만: 건설기간 전체 + 운영기간은 5년마다 + BEP 전후 + 마지막
+                if(y<=ana.constPeriod) return true;
+                if(y===ana.totalYears) return true;
+                if(ana.bepYear!==null&&Math.abs(y-ana.bepYear)<=1) return true;
+                // 전세2 전환 연도
+                const hasConv=rev.typeRevs?.some(t=>t.saleMode==="jeonse2"&&(+(t.jeonse2ConvYear)||20)+ana.constPeriod===y);
+                if(hasConv) return true;
+                return (y-ana.constPeriod)%5===0;
+              })).map((cf)=>{
+                const y=cf.y;
                 const yr=startY+y;
                 const pv=cf.net/(1+ana.dr)**y;
                 const cumCf=ana.cfs.slice(0,y+1).reduce((s,c)=>s+c.net,0);
-                const cumPv=ana.cfs.slice(0,y+1).reduce((s,c,t)=>s+c.net/(1+ana.dr)**t,0);
+                const isBep=ana.bepYear===y;
+                const isConst=y<=ana.constPeriod;
+                const isLast=y===ana.totalYears;
                 return(
-                  <tr key={y} style={{borderBottom:`1px solid ${C.faint}`,background:y%2?C.cardAlt:"#fff"}}>
-                    <td style={{padding:"6px 9px",fontSize:"11px",fontWeight:y===0?700:400,color:C.muted,borderRight:`1px solid ${C.border}`}}>{yr}년 ({y}년차)</td>
-                    {[cf.out,cf.inc,cf.net,cumCf,pv,cumPv].map((v,i)=>(
-                      <td key={i} style={{padding:"6px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"11px",color:i>=2?(v<0?C.red:v===0?C.muted:C.green):(i===0?C.red:C.green),fontWeight:i===2?700:400,borderRight:i<5?`1px solid ${C.border}`:"none"}}>
+                  <tr key={y} style={{borderBottom:`1px solid ${C.faint}`,background:isBep?"#f0fdf4":isLast?"#fef3c7":isConst?C.accentBg:y%2?C.cardAlt:"#fff"}}>
+                    <td style={{padding:"6px 9px",fontSize:"11px",fontWeight:isConst||isBep||isLast?700:400,color:isConst?C.accent:isBep?C.green:C.muted,borderRight:`1px solid ${C.border}`}}>
+                      {yr}년({y}년차) <span style={{fontSize:"9px",color:C.muted}}>{cf.label}</span>
+                      {isBep&&<span style={{fontSize:"9px",color:C.green,marginLeft:"3px"}}>★BEP</span>}
+                    </td>
+                    {[cf.out,cf.inc,cf.net,cumCf,pv].map((v,i)=>(
+                      <td key={i} style={{padding:"6px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"11px",color:i>=2?(v<0?C.red:v===0?C.muted:C.green):(i===0?C.red:C.green),fontWeight:i===2?700:400,borderRight:i<4?`1px solid ${C.border}`:"none"}}>
                         {v<0?`(${fM(Math.abs(v)*1000)})`:fM(v*1000)}
                       </td>
                     ))}
@@ -3184,9 +3565,10 @@ function AptFlowTab({apt,area,cost,rev,ana}){
         {/* 4. 분석 흐름 */}
         {ana&&<div>
           <div style={{fontSize:"12px",fontWeight:700,color:C.purple,marginBottom:"9px",paddingBottom:"5px",borderBottom:`2px solid ${C.purple}20`}}>🔍 사업성 분석</div>
-          <FBox title="① 현금흐름 구성" color={C.purple} items={
-            ana.cfs.map((cf,y)=>[(+(apt.cost.startYear)+y)+"년 ("+y+"년차)",`순: ${fM(cf.net*1000)}원`,`지출 ${fM(cf.out*1000)} / 수입 ${fM(cf.inc*1000)}`])
-          } note="0년: 토지+계약금 / 중간: 공사+중도금 / 준공: 잔금"/>
+          <FBox title="① 현금흐름 구성 (주요 연도)" color={C.purple} items={
+            ana.cfs.filter(cf=>cf.y<=ana.constPeriod||cf.y===ana.totalYears||(cf.y-ana.constPeriod)%10===0)
+              .map(cf=>[`${+(apt.cost.startYear)+cf.y}년(${cf.y}년차) ${cf.label}`,`순: ${fM(cf.net*1000)}원`,`지출 ${fM(cf.out*1000)} / 수입 ${fM(cf.inc*1000)}`])
+          } note={`전체 ${ana.totalYears}년 | 건설 ${ana.constPeriod}년 + 운영 ${ana.totalOpYears}년`}/>
           <div style={{textAlign:"center",fontSize:"16px",color:C.muted,margin:"3px 0"}}>↓</div>
           <FBox title="② 현재가치 할인 (IRR 산출)" color={C.purple} items={[
             ["할인율(IRR기준)", `${apt.anlys.discountR}%`],
@@ -3210,7 +3592,7 @@ function AptFlowTab({apt,area,cost,rev,ana}){
 // § APT-11. 검토기준 탭
 // ════════════════════════════════════════════════════════════════
 const C_apt="#6d28d9";
-function AptCriteriaTab(){
+function AptCriteriaTab({dispatch}){
   const thS={padding:"7px 10px",fontSize:"10px",color:C.muted,fontWeight:700,textAlign:"left",background:C.cardAlt,borderBottom:`1px solid ${C.border}`};
   const tdS={padding:"6px 10px",fontSize:"11px",borderBottom:`1px solid ${C.faint}`};
 
@@ -3218,6 +3600,37 @@ function AptCriteriaTab(){
     <div>
       <div style={{padding:"9px 13px",background:C.purpleBg,border:`1px solid ${C.purple}30`,borderRadius:"9px",marginBottom:"14px",fontSize:"11px",color:C.purple,lineHeight:1.7}}>
         이 탭은 공동주택 사업성 검토기에서 적용하는 모든 기준값과 법적 근거를 한눈에 확인할 수 있습니다. 수정은 각 탭의 입력란에서 직접 가능합니다.
+
+      {/* SH기준 프리셋 버튼 */}
+      <div style={{marginTop:"12px",padding:"13px 16px",background:"#f0f9ff",border:"1.5px solid #0ea5e9",borderRadius:"10px"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:"10px"}}>
+          <div>
+            <div style={{fontSize:"13px",fontWeight:700,color:"#0369a1",marginBottom:"3px"}}>🏢 SH(서울주택도시공사) 재무성분석 기준 프리셋</div>
+            <div style={{fontSize:"10px",color:"#0369a1",lineHeight:1.6}}>
+              할인율 4.5% (KDI) · 관리비 5.62% · 판매비 0.38% · 공실률 3% · 임대료상승 3%/2년 · 전세가율 80% · 수선유지비 0.5%/년 · GDP디플레이터 4.37%
+            </div>
+          </div>
+          <button onClick={()=>dispatch({type:"APT_SH_PRESET"})}
+            style={{padding:"9px 22px",borderRadius:"8px",border:"2px solid #0284c7",background:"#0284c7",color:"#fff",fontSize:"12px",fontWeight:700,cursor:"pointer",fontFamily:C.sans,whiteSpace:"nowrap"}}>
+            ✓ SH기준 일괄 적용
+          </button>
+        </div>
+        <div style={{marginTop:"9px",display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:"5px"}}>
+          {[["할인율","4.5%","KDI"],["일반관리비","5.62%","SH제공"],["판매비","0.38%","SH제공"],
+            ["직접인건비","2.0%","SH제공"],["공실률","3.0%","SH제공"],["임대료상승률","3%/2년","SH제공"],
+            ["전세가율","80%","SH제공"],["수선유지비","0.5%/년","SH제공"],["운영기간","40년","SH기준"],
+            ["GDP디플레이터","4.37%","한국은행"],["소비자물가","2.8%","통계청"],["지가상승률","3.1%","부동산원"],
+            ["주택도시기금금리","2.3%","국토교통부"],["SH공사채금리","2.76%","SH2025기준"],["이자수익","1.0%","SH제공"],
+            ["기금비율","60%","SH기준"],["공사채비율","30%","SH기준"],["자체자금","10%","SH기준"],
+          ].map(([l,v,s])=>(
+            <div key={l} style={{background:"#fff",borderRadius:"6px",padding:"4px 8px",border:"1px solid #bae6fd"}}>
+              <div style={{fontSize:"9px",color:"#0369a1",fontWeight:600}}>{l}</div>
+              <div style={{fontSize:"11px",fontFamily:C.mono,fontWeight:700,color:"#0c4a6e"}}>{v}</div>
+              <div style={{fontSize:"8px",color:C.muted}}>{s}</div>
+            </div>
+          ))}
+        </div>
+      </div>
       </div>
 
       <Card title="공사비 기준단가" tag="2024 공공건축물 공사비 가이드라인" accentBar={C.amber}>
@@ -3307,6 +3720,27 @@ function AptCriteriaTab(){
         </div>
       </Card>
 
+      <Card title="재원조달 기준 (SH 재무성분석)" tag="SH 주택도시기금 · 공사채" accentBar={C.green}>
+        <div style={{overflowX:"auto",border:`1px solid ${C.border}`,borderRadius:"8px"}}>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr><th style={thS}>구분</th><th style={{...thS,textAlign:"right"}}>금리/비율</th><th style={thS}>산정기준</th><th style={thS}>법적근거</th></tr></thead>
+            <tbody>
+              {[
+                ["주택도시기금(장기전세60이하)","2.3%","TDC의 약 60% 조달","국토교통부 고시"],
+                ["주택도시기금(장기전세60초과)","2.8%","TDC의 약 60% 조달","국토교통부 고시"],
+                ["SH공사채 발행이자","2.76%","TDC의 약 30% 조달","SH제공(2025년)"],
+                ["자체자금(SH지분)","—","TDC의 약 10%","SH기준"],
+                ["이자수익률","1.0%","보증금 등 운용수익","SH제공"],
+                ["토지보상기대수익률","4.5%","사업성분석 기준","SH제공"],
+              ].map(([l,r,b,n])=>(
+                <tr key={l}><td style={{...tdS,fontWeight:600}}>{l}</td><td style={{...tdS,textAlign:"right",fontFamily:C.mono,fontWeight:700,color:C.green}}>{r}</td><td style={tdS}>{b}</td><td style={{...tdS,fontSize:"10px",color:C.purple}}>{n}</td></tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div style={{marginTop:"8px",fontSize:"9px",color:C.muted}}>* 재원조달 탭에서 비율과 금리를 직접 수정할 수 있습니다. SH기준 적용 버튼으로 일괄 설정 가능.</div>
+      </Card>
+
       <Card title="분양 스케줄 관행" tag="관행 기준" accentBar="#dc2626">
         <div style={{overflowX:"auto",border:`1px solid ${C.border}`,borderRadius:"8px"}}>
           <table style={{width:"100%",borderCollapse:"collapse"}}>
@@ -3320,6 +3754,56 @@ function AptCriteriaTab(){
         </div>
         <div style={{marginTop:"8px",fontSize:"9px",color:C.muted}}>* 타당성 단계 단순화: 계약금(10%)/중도금(50%)/잔금(40%) 적용. 실제 협약에 따라 조정.</div>
       </Card>
+
+      <Card title="전세2(분양전환형) 적용 기준" tag="SH 장기전세 분양전환" accentBar="#7c3aed">
+        <div style={{padding:"9px 12px",background:"#f5f3ff",border:"1px solid #7c3aed30",borderRadius:"7px",fontSize:"10px",color:"#5b21b6",lineHeight:1.8,marginBottom:"9px"}}>
+          전세2는 장기전세 방식으로 운영 후 일정 기간 후 분양전환하는 SH 특수 사업방식입니다.
+        </div>
+        <div style={{overflowX:"auto",border:`1px solid ${C.border}`,borderRadius:"8px"}}>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr><th style={thS}>항목</th><th style={{...thS,textAlign:"right"}}>SH 적용 기준</th><th style={thS}>내용</th><th style={thS}>근거</th></tr></thead>
+            <tbody>
+              {[
+                ["전세보증금 산정","시세 × 전세가율(80%)","시세 조사 후 80% 적용","SH제공"],
+                ["분양전환 시기","준공 후 20년","장기전세2(전세2) 기준","공공주택 특별법"],
+                ["분양전환가격","감정평가액의 100%","준공 당시 감정가 기준","SH제공"],
+                ["보증금 운용수익","보증금 × 전환율(4.5%)","전세금 운용이익 반영","SH기준"],
+                ["공실률","3%","장기전세 기준","SH제공"],
+              ].map(([l,v,d,n])=>(
+                <tr key={l} style={{borderBottom:`1px solid ${C.faint}`}}>
+                  <td style={{...tdS,fontWeight:600,color:"#5b21b6"}}>{l}</td>
+                  <td style={{...tdS,textAlign:"right",fontFamily:C.mono,fontWeight:700,color:"#7c3aed"}}>{v}</td>
+                  <td style={tdS}>{d}</td>
+                  <td style={{...tdS,fontSize:"10px",color:C.purple}}>{n}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      <Card title="수선유지비 기준" tag="SH 재무성분석 운영비" accentBar={C.teal}>
+        <div style={{overflowX:"auto",border:`1px solid ${C.border}`,borderRadius:"8px"}}>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr><th style={thS}>항목</th><th style={{...thS,textAlign:"right"}}>SH 적용 기준</th><th style={thS}>산정방법</th><th style={thS}>근거</th></tr></thead>
+            <tbody>
+              {[
+                ["수선유지비율","0.5%/년","직접공사비 × 0.5% × 운영년수","SH제공"],
+                ["운영기간","40년","임대기간 기준","SH기준"],
+                ["수선충당금","전용면적×주택법기준","법정 수선충당금 별도","주택법 §51"],
+                ["총수선유지비","건축비의 약 20%","0.5% × 40년","SH재무모델"],
+              ].map(([l,v,d,n])=>(
+                <tr key={l} style={{borderBottom:`1px solid ${C.faint}`}}>
+                  <td style={{...tdS,fontWeight:600}}>{l}</td>
+                  <td style={{...tdS,textAlign:"right",fontFamily:C.mono,fontWeight:700,color:C.teal}}>{v}</td>
+                  <td style={tdS}>{d}</td>
+                  <td style={{...tdS,fontSize:"10px",color:C.purple}}>{n}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
     </div>
   );
 }
@@ -3328,12 +3812,13 @@ function AptCriteriaTab(){
 // § APT-12. 공동주택 메인 컴포넌트
 // ════════════════════════════════════════════════════════════════
 const APT_TABS=[
-  {id:"building",label:"건축개요",icon:"📐"},
-  {id:"cost",    label:"사업비",  icon:"💰"},
-  {id:"revenue", label:"분양수입",icon:"🏠"},
-  {id:"analysis",label:"사업성분석",icon:"🔍"},
-  {id:"flow",    label:"산출내역",icon:"🔁"},
-  {id:"criteria",label:"검토기준",icon:"📋"},
+  {id:"building", label:"건축개요",  icon:"📐"},
+  {id:"cost",     label:"사업비",    icon:"💰"},
+  {id:"revenue",  label:"분양수입",  icon:"🏠"},
+  {id:"funding",  label:"재원조달",  icon:"🏦"},
+  {id:"analysis", label:"사업성분석",icon:"🔍"},
+  {id:"flow",     label:"산출내역",  icon:"🔁"},
+  {id:"criteria", label:"검토기준",  icon:"📋"},
 ];
 
 function AptMode({onSwitch,user,authLoading,signIn,signOut,onSave,onLoad,lastSaved}){
@@ -3412,9 +3897,10 @@ function AptMode({onSwitch,user,authLoading,signIn,signOut,onSave,onLoad,lastSav
         {apt.aptActiveTab==="building" &&<AptBuildingTab apt={apt} dispatch={aptDispatch} area={area} onEum={()=>setShowEum(true)}/>}
         {apt.aptActiveTab==="cost"     &&<AptCostTab     apt={apt} dispatch={aptDispatch} area={area} cost={cost} onEum={()=>setShowEum(true)}/>}
         {apt.aptActiveTab==="revenue"  &&<AptRevenueTab  apt={apt} dispatch={aptDispatch} area={area} rev={rev}/>}
+        {apt.aptActiveTab==="funding"  &&<AptFundingTab  apt={apt} dispatch={aptDispatch} cost={cost} area={area}/>}
         {apt.aptActiveTab==="analysis" &&<AptAnalysisTab apt={apt} dispatch={aptDispatch} cost={cost} rev={rev} ana={ana}/>}
         {apt.aptActiveTab==="flow"     &&<AptFlowTab     apt={apt} area={area} cost={cost} rev={rev} ana={ana}/>}
-        {apt.aptActiveTab==="criteria" &&<AptCriteriaTab/>}
+        {apt.aptActiveTab==="criteria" &&<AptCriteriaTab dispatch={aptDispatch}/>}
       </div>
 
       <div style={{textAlign:"center",fontSize:"9px",color:C.muted,padding:"12px 0 24px",letterSpacing:"0.04em"}}>
