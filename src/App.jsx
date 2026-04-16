@@ -51,6 +51,7 @@ function useAuth(){
   const signIn=async()=>{
     try{
       const provider=new GoogleAuthProvider();
+      provider.setCustomParameters({prompt:"select_account"});
       await signInWithPopup(auth,provider);
     }catch(e){ console.error("로그인 실패:",e); }
   };
@@ -604,8 +605,18 @@ function reducer(state,{type,p}){
     case"SUPERV_RATE": return{...state,refs:{...state.refs,superv:p.v}};
     case"CHARGE_REF":  return{...state,refs:{...state.refs,charges:{...state.refs.charges,[p.key]:{...state.refs.charges[p.key],[p.k]:p.v}}}};
     case"CHARGE_RATE_TYPE": return{...state,refs:{...state.refs,charges:{...state.refs.charges,transport:{...state.refs.charges.transport,rateByType:{...state.refs.charges.transport.rateByType,[p.btype]:p.v}}}}};
+    case"LOAD_STATE": return{...p};
     default: return state;
   }
+}
+
+// 앱 시작 시 로컬스토리지에서 이전 상태 복원
+function getInitState(){
+  try{
+    const raw=localStorage.getItem(LOCAL_KEY);
+    if(raw){const parsed=JSON.parse(raw); if(parsed&&parsed.buildings&&parsed.site)return parsed;}
+  }catch(e){}
+  return initState;
 }
 
 // ═══════════════════════════════════════════════════════
@@ -3448,7 +3459,7 @@ const TABS=[
 
 export default function App(){
   const[mode,setMode]=useState("general"); // "general" | "apartment"
-  const[state,dispatch]=useReducer(reducer,initState);
+  const[state,dispatch]=useReducer(reducer,null,getInitState);
   const{siteMode,site,buildings,activeBldgId,activeTab,refs}=state;
   const D=useCallback((type,p)=>dispatch({type,p}),[]);
 
@@ -3508,11 +3519,10 @@ export default function App(){
     try{
       const s=await loadFromCloud(user.uid, projectId);
       if(!s){ showMsg("불러오기 실패"); return; }
-      // 상태 교체 — 페이지 리로드로 안전하게 적용
-      saveLocal(s);
-      window.location.reload();
-    }catch(e){ showMsg("불러오기 실패: "+e.message); }
-    setShowLoadModal(false);
+      dispatch({type:"LOAD_STATE", p:s});
+      setShowLoadModal(false);
+      showMsg("✓ 불러오기 완료");
+    }catch(e){ showMsg("불러오기 실패: "+e.message); setShowLoadModal(false); }
   };
 
   const handleDeleteProject=async(projectId)=>{
