@@ -304,14 +304,21 @@ function getChargeStatus(chargeKey, bldg, area){
 const calcNPV=(cfs,r)=>cfs.reduce((s,c,t)=>s+c/(1+r)**t,0);
 function calcIRR(cfs){
   if(cfs.every(c=>c>=0)||cfs.every(c=>c<=0))return null;
-  let r=0.1;
-  for(let i=0;i<2000;i++){
-    const f=cfs.reduce((s,c,t)=>s+c/(1+r)**t,0);
-    const df=cfs.reduce((s,c,t)=>s-t*c/(1+r)**(t+1),0);
-    if(Math.abs(df)<1e-12)break;
-    const r1=r-f/df; if(Math.abs(r1-r)<1e-9){r=r1;break;} r=Math.max(-0.999,r1);
+  const npv=(r)=>cfs.reduce((s,c,t)=>s+c/(1+r)**t,0);
+  // 1단계: 브래킷 탐색 (-99% ~ 999% 범위에서 부호 변환 지점 찾기)
+  let lo=-0.99, hi=10, found=false;
+  for(let r=lo;r<=hi;r+=0.05){
+    if(npv(r)*npv(r+0.05)<0){ lo=r; hi=r+0.05; found=true; break; }
   }
-  return(r>-1&&r<10)?r:null;
+  if(!found) return null;
+  // 2단계: 이분법으로 정밀화
+  for(let i=0;i<80;i++){
+    const mid=(lo+hi)/2;
+    if(Math.abs(hi-lo)<1e-9) break;
+    if(npv(lo)*npv(mid)<=0) hi=mid; else lo=mid;
+  }
+  const r=(lo+hi)/2;
+  return(r>-0.99&&r<10)?r:null;
 }
 
 function getDesignRate(constr, brackets){
@@ -2209,7 +2216,7 @@ function calcAptCost(apt,area){
 
   // ── 재원조달 계산 (5번) ──
   const fd=apt.funding||{};
-  const govGrant=(+(fd.govGrantApply)==="Y"||fd.govGrantApply==="Y")
+  const govGrant=(fd.govGrantApply==="Y")
     ? area.totalUnits*(+(fd.govGrantPerUnit)||0) : 0;
   const cityGrant=(fd.cityGrantApply==="Y") ? +(fd.cityGrantAmt)||0 : 0;
   const totalGrant=govGrant+cityGrant;
@@ -2255,8 +2262,11 @@ function calcAptRevenue(apt,area,cost){
       // 분양전환 수입: 전환가격 입력 or 자동계산
       let convPrice=+(t.jeonse2ConvPrice)||0;
       if(!convPrice&&+(t.jeonse2Deposit)>0){
-        // 자동: 보증금/㎡ × 전환가율% / 전세가율% × 공급면적
-        convPrice=t.tSupply*(+(t.jeonse2Deposit)/((+(r.jeonseRate)||80)/100))*(+(t.jeonse2ConvRate)||100)/100;
+        // 자동: 시세(원/전용㎡) = 보증금단가 ÷ 전세가율
+        // 분양전환가 = 시세 × 전용면적합계 × 전환가율%
+        // 단위: 원/전용㎡ × 전용㎡ × % → 원 → /1000 → 천원
+        const sisePerExcl=+(t.jeonse2Deposit)/((+(r.jeonseRate)||80)/100); // 원/전용㎡
+        convPrice=t.tExcl*sisePerExcl*(+(t.jeonse2ConvRate)||100)/100/1000; // 천원
       }
       aptJeonse2Conv+=convPrice;
       return{...t, inc:0, annInc:depInc, dep, convInc:convPrice,
@@ -2340,8 +2350,10 @@ function calcAptAnalysis(apt,cost,rev){
   const landResidualR=(+(an.landResidualR)||100)/100;
 
   // ─── 경상가 변환 헬퍼 ───
-  // 불변가→경상가: value × (1+gdp)^y / (1+gdp)^baseY
-  // baseY = 0 (기준시점)
+  // SH 기준: 불변가 기준일(Y=0) 이후 Y년 경과 시 물가 누적 반영
+  // 경상가 = 불변가 × (1+GDP디플레이터)^Y
+  // Y=0: 경상가 = 불변가 × 1 (기준시점은 동일)
+  // Y=1: 1년 후 물가 반영, Y=2: 2년 후 물가 반영...
   const toReal=(val,y)=>isReal?val*Math.pow(1+gd,y):val;
 
   // ─── 연도별 현금흐름 구성 ───
@@ -2361,10 +2373,16 @@ function calcAptAnalysis(apt,cost,rev){
       inc=toReal(midAmt/(constPeriod-1||1),y);
       label=`공사(${y}년차)`;
     } else if(y===constPeriod){
-      // 준공(Y=constPeriod): 공사비 마지막 + 잔금 + 분양수입
+      // 준공(Y=constPeriod): 공사비 마지막 + 잔금 + 분양수입 + (SH) 임대보증금 수령
       out=toReal(nonLandCost/constPeriod,y);
-      inc=toReal(balanceAmt+pkInc,y);
-      label="준공·잔금";
+      // SH모드: 준공 시 임대/전세2 보증금 일시 수령 (보증금 총액)
+      const totalDeposit=isSHMode?rev.typeRevs.reduce((s,t)=>{
+        if(t.saleMode==="rent") return s+(t.dep||0);
+        if(t.saleMode==="jeonse2") return s+(t.dep||0);
+        return s;
+      },0)+rev.nrRevs.reduce((s,nr)=>s+(nr.saleMode==="rent"?nr.dep||0:0),0):0;
+      inc=toReal(balanceAmt+pkInc+(totalDeposit||0),y);
+      label="준공·잔금"+(isSHMode&&totalDeposit>0?"·보증금수령":"");
     } else {
       // 운영기간(Y=constPeriod+1 ~ totalYears): 임대료 + 수선유지비
       const opY=y-constPeriod; // 운영 경과년
@@ -2383,11 +2401,18 @@ function calcAptAnalysis(apt,cost,rev){
         }
       });
 
-      // 사업 마지막 해: 토지잔존가치
+      // 사업 마지막 해: 토지잔존가치 + 보증금 반환
       if(y===totalYears){
         const landResidual=land*Math.pow(1+landRiseR,totalYears)*landResidualR;
+        // 보증금 반환 (SH모드): 마지막 해에 전세 보증금 전액 반환 (운영비 지출)
+        const totalDeposit=isSHMode?rev.typeRevs.reduce((s,t)=>{
+          if(t.saleMode==="rent") return s+(t.dep||0);
+          if(t.saleMode==="jeonse2") return s+(t.dep||0);
+          return s;
+        },0)+rev.nrRevs.reduce((s,nr)=>s+(nr.saleMode==="rent"?nr.dep||0:0),0):0;
         inc+=toReal(landResidual,y);
-        label="사업종료·잔존가치";
+        out+=toReal(totalDeposit||0,y); // 보증금 반환
+        label="사업종료·잔존가치"+(isSHMode&&totalDeposit>0?"·보증금반환":"");
       }
     }
     cfs.push({y,out,inc,net:inc-out,label});
@@ -2479,8 +2504,9 @@ function aptReducer(state,{type,p}){
     };
     case"APT_FUNDING":  return{...state,funding:{...state.funding,...p}};
     case"APT_ANLYS_MODE": return{...state,anlys:{...state.anlys,priceMode:p}};
+    case"LOAD_STATE": return{...p};  // apt 전체 상태 교체 (불러오기용)
     case"APT_MODE": return{...state, analysisMode:p,
-      // 모드 전환 시 기본값 세팅
+      aptActiveTab:"building", // 탭 초기화 (재원조달 탭 등 모드에 없는 탭 방지)
       ...(p==="sh"?{
         cost:{...state.cost,mgmtR:"5.62",salesR:"0.38",directLaborR:"2.0",reserveR:"10.0",loanR:"2.76",maintR:"0.5",operYears:"40"},
         revenue:{...state.revenue,convR:"4.5",vacancyR:"3",jeonse2VacancyR:"3",rentRiseR:"3.0",jeonseRate:"80"},
@@ -3097,9 +3123,9 @@ function AptRevenueTab({apt,dispatch,area,rev,isSH}){
             <div style={{fontSize:"10px",color:C.muted,marginTop:"4px"}}>= {fM(rev.balanceAmt*1000)}원 (준공시)</div>
           </div>
         </G>
-        {(Number(r.contractR)+Number(r.midR)+Number(r.balanceR))!==100&&(
+        {Math.abs(Number(r.contractR)+Number(r.midR)+Number(r.balanceR)-100)>0.5&&(
           <div style={{marginTop:"8px",padding:"6px 10px",background:C.redBg,borderRadius:"6px",fontSize:"10px",color:C.red}}>
-            ⚠ 합계 = {Number(r.contractR)+Number(r.midR)+Number(r.balanceR)}% — 100%가 되도록 조정해 주세요.
+            ⚠ 합계 = {(Number(r.contractR)+Number(r.midR)+Number(r.balanceR)).toFixed(1)}% — 100%가 되도록 조정해 주세요.
           </div>
         )}
       </Card>
@@ -3435,15 +3461,21 @@ function AptAnalysisTab({apt,dispatch,cost,rev,ana,isSH}){
                 const adjContract=adjSale*(+(apt.revenue.contractR)||10)/100;
                 const adjMid=adjSale*(+(apt.revenue.midR)||50)/100;
                 const adjBal=adjSale*(+(apt.revenue.balanceR)||40)/100;
-                const adjCfs=ana.cfs.map((cf,y)=>{
-                  let inc=y===0?adjContract:y<ana.period?adjMid/(ana.period-1||1):adjBal+rev.pkInc;
+                // SH모드: 운영기간 CF는 원래 값 유지, 건설기간만 분양가 변동 반영
+                const adjCfs=ana.cfs.map((cf)=>{
+                  const y=cf.y;
+                  let inc;
+                  if(y===0) inc=adjContract;
+                  else if(y<ana.constPeriod) inc=adjMid/(ana.constPeriod-1||1);
+                  else if(y===ana.constPeriod) inc=adjBal+rev.pkInc;
+                  else inc=cf.inc; // 운영기간: 임대료 등 원래 값 유지
                   return{...cf, net:inc-cf.out};
                 });
                 const adjCfNets=adjCfs.map(c=>c.net);
                 const adjNPV=calcNPV(adjCfNets,ana.dr);
                 const adjIRR=calcIRR(adjCfNets);
                 let adjPvOut=0,adjPvInc=0;
-                adjCfs.forEach((cf,y)=>{ adjPvOut+=cf.out/(1+ana.dr)**y; adjPvInc+=(y===0?adjContract:y<ana.period?adjMid/(ana.period-1||1):adjBal+rev.pkInc)/(1+ana.dr)**y; });
+                adjCfs.forEach((cf)=>{ adjPvOut+=cf.out/(1+ana.dr)**cf.y; adjPvInc+=cf.inc/(1+ana.dr)**cf.y; });
                 const adjPI=adjPvOut>0?adjPvInc/adjPvOut:0;
                 const adjProfit=adjSale-cost.tdc;
                 const base=dp===0;
@@ -3876,17 +3908,94 @@ const getAptTabs=(mode)=>[
 ];
 
 function AptMode({onSwitch,user,authLoading,signIn,signOut,onSave,onLoad,lastSaved}){
-  const[apt,aptDispatch]=useReducer(aptReducer,initAptState);
+  const[apt,aptDispatch]=useReducer(aptReducer,null,()=>{
+    // 시작 시 로컬에서 apt 상태 복원 시도
+    try{
+      const raw=localStorage.getItem("apt_v8_state");
+      if(raw){ const p=JSON.parse(raw); if(p&&p.types&&p.siteInfo)return p; }
+    }catch(e){}
+    return initAptState;
+  });
   const[showEum,setShowEum]=useState(false);
   const[showModeGuide,setShowModeGuide]=useState(false);
+  const[aptLastSaved,setAptLastSaved]=useState(null);
+  const[aptSaveMsg,setAptSaveMsg]=useState(null);
+  const[aptShowLoad,setAptShowLoad]=useState(false);
+  const[aptProjectList,setAptProjectList]=useState([]);
+  const[aptLoadingList,setAptLoadingList]=useState(false);
+
+  const showAptMsg=(msg)=>{ setAptSaveMsg(msg); setTimeout(()=>setAptSaveMsg(null),3000); };
+
+  // apt 전용 클라우드 저장
+  const handleAptSave=async()=>{
+    if(user){
+      try{
+        const projName=(apt.projectName||"공동주택 프로젝트");
+        const id="apt_"+Date.now();
+        const{setDoc,doc,serverTimestamp:sTs}=await import("firebase/firestore");
+        await setDoc(doc(db,"users",user.uid,"apt_projects",id),{
+          name:projName, state:JSON.stringify(apt), savedAt:sTs(),
+        });
+        localStorage.setItem("apt_v8_state",JSON.stringify(apt));
+        const t=new Date().toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit"});
+        setAptLastSaved(t);
+        showAptMsg("✓ 클라우드 저장 완료");
+      }catch(e){ showAptMsg("저장 실패: "+e.message); }
+    } else {
+      localStorage.setItem("apt_v8_state",JSON.stringify(apt));
+      const t=new Date().toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit"});
+      setAptLastSaved(t);
+      showAptMsg("✓ 로컬 저장됨");
+    }
+  };
+
+  // apt 전용 불러오기
+  const handleAptLoad=async()=>{
+    if(user){
+      setAptLoadingList(true);
+      setAptShowLoad(true);
+      try{
+        const{getDocs,collection}=await import("firebase/firestore");
+        const snap=await getDocs(collection(db,"users",user.uid,"apt_projects"));
+        const list=snap.docs.map(d=>({id:d.id,...d.data(),savedAt:d.data().savedAt?.toDate?.()?.toLocaleString("ko-KR")||""}));
+        setAptProjectList(list.sort((a,b)=>new Date(b.savedAt)-new Date(a.savedAt)));
+      }catch(e){ showAptMsg("목록 불러오기 실패"); }
+      setAptLoadingList(false);
+    } else {
+      try{
+        const raw=localStorage.getItem("apt_v8_state");
+        if(!raw){ showAptMsg("저장된 데이터 없음"); return; }
+        const s=JSON.parse(raw);
+        aptDispatch({type:"LOAD_STATE",p:s});
+        showAptMsg("✓ 로컬에서 불러옴");
+      }catch(e){ showAptMsg("불러오기 실패"); }
+    }
+  };
+
+  const handleAptLoadProject=async(projectId)=>{
+    try{
+      const{getDoc,doc}=await import("firebase/firestore");
+      const snap=await getDoc(doc(db,"users",user.uid,"apt_projects",projectId));
+      if(!snap.exists()){ showAptMsg("불러오기 실패"); return; }
+      const s=JSON.parse(snap.data().state);
+      aptDispatch({type:"LOAD_STATE",p:s});
+      setAptShowLoad(false);
+      showAptMsg("✓ 불러오기 완료");
+    }catch(e){ showAptMsg("불러오기 실패: "+e.message); setAptShowLoad(false); }
+  };
   const aptMode=apt.analysisMode||"standard";
   const isSH=aptMode==="sh";
   const APT_TABS=getAptTabs(aptMode);
 
   const area=useMemo(()=>calcAptArea(apt),[apt.types,apt.nonResi,apt.parking,apt.siteInfo]);
-  const cost=useMemo(()=>calcAptCost(apt,area),[apt,area]);
-  const rev=useMemo(()=>calcAptRevenue(apt,area,cost),[apt,area,cost]);
-  const ana=useMemo(()=>rev.totalSale>0&&cost.tdc>0?calcAptAnalysis(apt,cost,rev):null,[apt,cost,rev]);
+  const cost=useMemo(()=>calcAptCost(apt,area),[apt.cost,apt.funding,area]);
+  const rev=useMemo(()=>calcAptRevenue(apt,area,cost),[apt.types,apt.nonResi,apt.parking,apt.revenue,area,cost]);
+  const ana=useMemo(()=>{
+    // 분양수입 OR 임대수입 있고 TDC > 0이면 분석 실행
+    const hasRevenue=rev.totalSale>0||rev.totalRentAnn>0;
+    if(!hasRevenue||cost.tdc<=0) return null;
+    return calcAptAnalysis(apt,cost,rev);
+  },[apt,cost,rev]);
 
   const totSale=rev.totalSale;
   const tdc=cost.tdcTotal;
@@ -3894,6 +4003,46 @@ function AptMode({onSwitch,user,authLoading,signIn,signOut,onSave,onLoad,lastSav
   return(
     <div style={{fontFamily:C.sans,background:C.bg,color:C.text,minHeight:"100vh",fontSize:"13px"}}>
       {showEum&&<EumModal onClose={()=>setShowEum(false)}/>}
+
+      {/* apt 불러오기 모달 */}
+      {aptShowLoad&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:9000,display:"flex",alignItems:"center",justifyContent:"center",padding:"16px"}}>
+          <div style={{background:"#fff",borderRadius:"12px",boxShadow:"0 20px 60px rgba(0,0,0,0.3)",width:"min(560px,95vw)",maxHeight:"80vh",display:"flex",flexDirection:"column",overflow:"hidden"}}>
+            <div style={{padding:"14px 18px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",gap:"10px"}}>
+              <span style={{fontSize:"16px"}}>📂</span>
+              <div style={{flex:1}}>
+                <div style={{fontSize:"13px",fontWeight:700}}>저장된 공동주택 프로젝트</div>
+                <div style={{fontSize:"10px",color:C.muted}}>클라우드에 저장된 프로젝트를 불러옵니다</div>
+              </div>
+              <button onClick={()=>setAptShowLoad(false)} style={{width:"28px",height:"28px",borderRadius:"50%",border:`1px solid ${C.border}`,background:"#fff",cursor:"pointer",fontSize:"16px",fontWeight:700,fontFamily:C.sans}}>×</button>
+            </div>
+            <div style={{overflowY:"auto",padding:"12px"}}>
+              {aptLoadingList?(
+                <div style={{textAlign:"center",padding:"30px",color:C.muted}}>불러오는 중...</div>
+              ):aptProjectList.length===0?(
+                <div style={{textAlign:"center",padding:"30px",color:C.muted}}>저장된 프로젝트가 없습니다</div>
+              ):(
+                aptProjectList.map(p=>(
+                  <div key={p.id} style={{display:"flex",alignItems:"center",gap:"10px",padding:"11px 14px",borderRadius:"8px",border:`1px solid ${C.border}`,marginBottom:"8px"}}>
+                    <div style={{flex:1}}>
+                      <div style={{fontSize:"13px",fontWeight:600}}>{p.name}</div>
+                      <div style={{fontSize:"10px",color:C.muted}}>저장: {p.savedAt||"—"}</div>
+                    </div>
+                    <button onClick={()=>handleAptLoadProject(p.id)} style={{padding:"5px 14px",borderRadius:"6px",border:`1.5px solid ${C_apt}`,background:C.purpleBg,color:C_apt,fontSize:"11px",fontWeight:600,cursor:"pointer",fontFamily:C.sans}}>불러오기</button>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* apt 저장 토스트 */}
+      {aptSaveMsg&&(
+        <div style={{position:"fixed",bottom:"24px",right:"24px",zIndex:9999,padding:"10px 18px",borderRadius:"9px",background:C_apt,color:"#fff",fontSize:"13px",fontWeight:600,boxShadow:"0 4px 20px rgba(0,0,0,0.3)"}}>
+          {aptSaveMsg}
+        </div>
+      )}
 
       {/* 헤더 */}
       <div style={{background:"#3b0764",padding:"11px 18px",display:"flex",alignItems:"center",gap:"13px",position:"sticky",top:0,zIndex:400,boxShadow:"0 2px 8px rgba(0,0,0,0.3)"}}>
@@ -3926,9 +4075,10 @@ function AptMode({onSwitch,user,authLoading,signIn,signOut,onSave,onLoad,lastSav
           🏢 일반건축물로 전환
         </button>
         <div style={{width:"1px",height:"18px",background:C.border}}/>
-        <button onClick={onLoad} style={{padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C.mid,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>📂 불러오기</button>
-        <button onClick={onSave} style={{padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.accent}`,background:C.accentBg,color:C.accent,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>💾 저장</button>
-        {lastSaved&&<span style={{fontSize:"9px",color:C.muted}}>저장: {lastSaved}</span>}
+        <button onClick={handleAptLoad} style={{padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C.mid,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>📂 불러오기{user?" (클라우드)":""}</button>
+        <button onClick={handleAptSave} style={{padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.accent}`,background:C.accentBg,color:C.accent,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>💾 저장{user?" (클라우드)":""}</button>
+        {aptLastSaved&&<span style={{fontSize:"9px",color:C.muted}}>저장: {aptLastSaved}</span>}
+        {aptSaveMsg&&<span style={{fontSize:"10px",color:C.green,fontWeight:600}}>{aptSaveMsg}</span>}
         <div style={{width:"1px",height:"18px",background:C.border}}/>
         {user?(
           <div style={{display:"flex",alignItems:"center",gap:"6px"}}>
