@@ -105,6 +105,28 @@ async function deleteProject(uid, projectId){
   await deleteDoc(doc(db,"users",uid,"projects",projectId));
 }
 
+async function savePublicToCloud(uid, state, projectName="공공건축물 프로젝트"){
+  const id="public_"+Date.now();
+  await setDoc(doc(db,"users",uid,"public_projects",id),{
+    name:projectName||"공공건축물 프로젝트",
+    state:JSON.stringify(state),
+    savedAt:serverTimestamp(),
+  });
+  return id;
+}
+async function loadPublicProjectList(uid){
+  const snap=await getDocs(collection(db,"users",uid,"public_projects"));
+  return snap.docs.map(d=>({id:d.id,...d.data(),savedAt:d.data().savedAt?.toDate?.()?.toLocaleString("ko-KR")||""}));
+}
+async function loadPublicFromCloud(uid, projectId){
+  const snap=await getDoc(doc(db,"users",uid,"public_projects",projectId));
+  if(!snap.exists()) return null;
+  return JSON.parse(snap.data().state);
+}
+async function deletePublicProject(uid, projectId){
+  await deleteDoc(doc(db,"users",uid,"public_projects",projectId));
+}
+
 // ═══════════════════════════════════════════════════════
 // § 1. 법정 기준 데이터
 // ═══════════════════════════════════════════════════════
@@ -654,6 +676,9 @@ function AuthBar({user,loading,signIn,signOut,onSave,onLoad,lastSaved,onModeSwit
     <div style={{background:"#fff",borderBottom:`1px solid ${C.border}`,padding:"6px 18px",display:"flex",alignItems:"center",gap:"10px",flexWrap:"wrap",justifyContent:"flex-end"}}>
       <button onClick={()=>onModeSwitch&&onModeSwitch("apartment")} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:"1.5px solid #7c3aed",background:"#f5f3ff",color:"#7c3aed",fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:700}}>
         🏠 공동주택
+      </button>
+      <button onClick={()=>onModeSwitch&&onModeSwitch("public")} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:"1.5px solid #0f766e",background:"#ccfbf1",color:"#0f766e",fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:700}}>
+        🏛 공공건축물
       </button>
       <div style={{width:"1px",height:"18px",background:C.border}}/>
       <button onClick={onLoad} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C.mid,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>
@@ -4188,6 +4213,420 @@ function AptMode({onSwitch,user,authLoading,signIn,signOut,onSave,onLoad,lastSav
   );
 }
 
+// ════════════════════════════════════════════════════════════════
+// § PUBLIC-1. 공공건축물 사업성/B-C 계산기
+// ════════════════════════════════════════════════════════════════
+const PUBLIC_LOCAL_KEY="public_facility_v1_state";
+const C_public="#0f766e";
+
+const PUBLIC_TEMPLATES={
+  museum:{
+    label:"박물관", icon:"🏛", projectName:"박물관 건립사업",
+    area:{siteArea:"8000",buildingArea:"2800",gfa:"9500",floorsAbove:"3",floorsBelow:"1"},
+    cost:{landCost:"0",constrUnit:"4200",indirectR:"18",reserveR:"10",financeR:"4.5",constYears:"3"},
+    revenue:{visitors:"180000",ticket:"6000",ancillaryPerVisitor:"2500",rentIncome:"0",publicBenefitPerVisitor:"12000",visitorGrowthR:"1.0",opCost:"2100000",opCostGrowthR:"2.0"},
+  },
+  exhibition:{
+    label:"전시관", icon:"🖼", projectName:"전시관 건립사업",
+    area:{siteArea:"6000",buildingArea:"2200",gfa:"7200",floorsAbove:"3",floorsBelow:"1"},
+    cost:{landCost:"0",constrUnit:"3900",indirectR:"17",reserveR:"10",financeR:"4.5",constYears:"3"},
+    revenue:{visitors:"150000",ticket:"5000",ancillaryPerVisitor:"1800",rentIncome:"60000",publicBenefitPerVisitor:"9000",visitorGrowthR:"1.0",opCost:"1550000",opCostGrowthR:"2.0"},
+  },
+  library:{
+    label:"도서관", icon:"📚", projectName:"도서관 건립사업",
+    area:{siteArea:"4500",buildingArea:"1600",gfa:"5200",floorsAbove:"4",floorsBelow:"1"},
+    cost:{landCost:"0",constrUnit:"3500",indirectR:"16",reserveR:"10",financeR:"4.5",constYears:"2"},
+    revenue:{visitors:"260000",ticket:"0",ancillaryPerVisitor:"300",rentIncome:"0",publicBenefitPerVisitor:"6500",visitorGrowthR:"0.8",opCost:"1250000",opCostGrowthR:"2.0"},
+  },
+  gym:{
+    label:"체육관", icon:"🏟", projectName:"체육관 건립사업",
+    area:{siteArea:"9000",buildingArea:"3500",gfa:"8500",floorsAbove:"2",floorsBelow:"1"},
+    cost:{landCost:"0",constrUnit:"3600",indirectR:"16",reserveR:"10",financeR:"4.5",constYears:"2"},
+    revenue:{visitors:"220000",ticket:"3500",ancillaryPerVisitor:"1000",rentIncome:"120000",publicBenefitPerVisitor:"5000",visitorGrowthR:"0.8",opCost:"1650000",opCostGrowthR:"2.0"},
+  },
+  culture:{
+    label:"문화센터", icon:"🎭", projectName:"문화센터 건립사업",
+    area:{siteArea:"5000",buildingArea:"1900",gfa:"6000",floorsAbove:"4",floorsBelow:"1"},
+    cost:{landCost:"0",constrUnit:"3700",indirectR:"16",reserveR:"10",financeR:"4.5",constYears:"2"},
+    revenue:{visitors:"200000",ticket:"2500",ancillaryPerVisitor:"1300",rentIncome:"90000",publicBenefitPerVisitor:"7000",visitorGrowthR:"1.0",opCost:"1400000",opCostGrowthR:"2.0"},
+  },
+};
+
+const mkPublicState=(templateKey="museum")=>{
+  const t=PUBLIC_TEMPLATES[templateKey]||PUBLIC_TEMPLATES.museum;
+  return{
+    projectName:t.projectName,
+    templateKey,
+    area:{location:"",zoneType:"제2종일반주거",...t.area},
+    cost:{...t.cost,designNote:"공공건축물 공사비 가이드라인 등 검토단계 단가"},
+    revenue:{...t.revenue},
+    anlys:{discountR:"4.5",analysisYears:"30",residualR:"10",benefitMode:"financial_public"},
+    activeTab:"overview",
+  };
+};
+const initPublicState=mkPublicState("museum");
+
+function publicReducer(state,{type,p}){
+  switch(type){
+    case"PUBLIC_TEMPLATE":{
+      const next=mkPublicState(p);
+      return{...next,area:{...next.area,location:state.area.location},activeTab:state.activeTab};
+    }
+    case"PUBLIC_PROJECT": return{...state,projectName:p};
+    case"PUBLIC_AREA": return{...state,area:{...state.area,...p}};
+    case"PUBLIC_COST": return{...state,cost:{...state.cost,...p}};
+    case"PUBLIC_REV": return{...state,revenue:{...state.revenue,...p}};
+    case"PUBLIC_ANLYS": return{...state,anlys:{...state.anlys,...p}};
+    case"PUBLIC_TAB": return{...state,activeTab:p};
+    case"PUBLIC_LOAD": return{...p};
+    default: return state;
+  }
+}
+
+function getPublicInitState(){
+  try{
+    const raw=localStorage.getItem(PUBLIC_LOCAL_KEY);
+    if(raw){ const parsed=JSON.parse(raw); if(parsed&&parsed.area&&parsed.cost&&parsed.revenue)return parsed; }
+  }catch{
+    return initPublicState;
+  }
+  return initPublicState;
+}
+
+function calcPublicFacility(pub){
+  const a=pub.area, c=pub.cost, r=pub.revenue, an=pub.anlys;
+  const gfa=n(a.gfa), site=n(a.siteArea), bldg=n(a.buildingArea);
+  const bcr=site>0?bldg/site*100:0;
+  const far=site>0?gfa/site*100:0;
+  const direct=gfa*n(c.constrUnit);
+  const indirect=direct*n(c.indirectR)/100;
+  const base=n(c.landCost)+direct+indirect;
+  const reserve=base*n(c.reserveR)/100;
+  const beforeFinance=base+reserve;
+  const finance=beforeFinance*n(c.financeR)/100*Math.max(1,n(c.constYears))/2;
+  const totalCost=beforeFinance+finance;
+  const years=Math.max(1,Math.round(n(an.analysisYears)));
+  const constYears=Math.max(1,Math.round(n(c.constYears)));
+  const dr=n(an.discountR)/100;
+  const visitorGrowth=n(r.visitorGrowthR)/100;
+  const opGrowth=n(r.opCostGrowthR)/100;
+  const residual=totalCost*n(an.residualR)/100;
+  const cfs=[];
+  let pvBenefit=0, pvCost=0;
+  for(let y=0;y<=constYears+years;y++){
+    let cost=0, benefit=0, visitors=0, financial=0, publicBenefit=0, opCost=0, label="";
+    if(y<constYears){
+      cost=totalCost/constYears;
+      label=y===0?"착수·투자":"건설투자";
+    } else {
+      const opY=y-constYears+1;
+      visitors=n(r.visitors)*(1+visitorGrowth)**(opY-1);
+      financial=visitors*(n(r.ticket)+n(r.ancillaryPerVisitor))/1000+n(r.rentIncome);
+      publicBenefit=visitors*n(r.publicBenefitPerVisitor)/1000;
+      opCost=n(r.opCost)*(1+opGrowth)**(opY-1);
+      benefit=financial+publicBenefit+(opY===years?residual:0);
+      cost=opCost;
+      label=opY===years?"운영·잔존가치":"운영";
+    }
+    const net=benefit-cost;
+    const pvB=benefit/(1+dr)**y;
+    const pvC=cost/(1+dr)**y;
+    pvBenefit+=pvB;
+    pvCost+=pvC;
+    cfs.push({y,label,cost,benefit,net,visitors,financial,publicBenefit,opCost,pvB,pvC,pv:net/(1+dr)**y});
+  }
+  const cfNets=cfs.map(cf=>cf.net);
+  const NPV=calcNPV(cfNets,dr);
+  const IRR=calcIRR(cfNets);
+  const bc=pvCost>0?pvBenefit/pvCost:0;
+  let cum=0,payback=null;
+  cfs.forEach(cf=>{ cum+=cf.net; cf.cum=cum; if(payback===null&&cum>=0) payback=cf.y; });
+  const firstOp=cfs.find(cf=>cf.y>=constYears)||{};
+  return{gfa,site,bldg,bcr,far,direct,indirect,reserve,finance,totalCost,beforeFinance,
+    years,constYears,dr,residual,cfs,pvBenefit,pvCost,NPV,IRR:IRR!==null?IRR*100:null,bc,payback,firstOp};
+}
+
+const PUBLIC_TABS=[
+  {id:"overview",label:"시설개요",icon:"🏛"},
+  {id:"cost",label:"사업비",icon:"💰"},
+  {id:"benefit",label:"수입/편익",icon:"🎟"},
+  {id:"analysis",label:"B/C 분석",icon:"🔍"},
+  {id:"flow",label:"산출내역",icon:"🔁"},
+];
+
+function PublicMode({onSwitch,user,authLoading,signIn,signOut}){
+  const[pub,dispatch]=useReducer(publicReducer,null,getPublicInitState);
+  const[saveMsg,setSaveMsg]=useState(null);
+  const[lastSaved,setLastSaved]=useState(null);
+  const[showLoad,setShowLoad]=useState(false);
+  const[projectList,setProjectList]=useState([]);
+  const[loadingList,setLoadingList]=useState(false);
+  const calc=useMemo(()=>calcPublicFacility(pub),[pub]);
+  const D=(type,p)=>dispatch({type,p});
+  const msg=m=>{ setSaveMsg(m); setTimeout(()=>setSaveMsg(null),3000); };
+
+  const handleSave=async()=>{
+    if(user){
+      try{
+        await savePublicToCloud(user.uid,pub,pub.projectName||"공공건축물 프로젝트");
+        localStorage.setItem(PUBLIC_LOCAL_KEY,JSON.stringify(pub));
+        setLastSaved(new Date().toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit"}));
+        msg("✓ 클라우드 저장 완료");
+      }catch(e){ msg("저장 실패: "+e.message); }
+    }else{
+      try{
+        localStorage.setItem(PUBLIC_LOCAL_KEY,JSON.stringify(pub));
+        setLastSaved(new Date().toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit"}));
+        msg("✓ 로컬 저장됨");
+      }catch{ msg("저장 실패"); }
+    }
+  };
+  const handleLoad=async()=>{
+    if(user){
+      setShowLoad(true); setLoadingList(true);
+      try{
+        const list=await loadPublicProjectList(user.uid);
+        setProjectList(list.sort((a,b)=>new Date(b.savedAt)-new Date(a.savedAt)));
+      }catch{ msg("목록 불러오기 실패"); }
+      setLoadingList(false);
+    }else{
+      try{
+        const raw=localStorage.getItem(PUBLIC_LOCAL_KEY);
+        if(!raw){ msg("저장된 데이터 없음"); return; }
+        D("PUBLIC_LOAD",JSON.parse(raw));
+        msg("✓ 로컬에서 불러옴");
+      }catch{ msg("불러오기 실패"); }
+    }
+  };
+  const handleLoadProject=async(id)=>{
+    try{
+      const s=await loadPublicFromCloud(user.uid,id);
+      if(!s){ msg("불러오기 실패"); return; }
+      D("PUBLIC_LOAD",s); setShowLoad(false); msg("✓ 불러오기 완료");
+    }catch(e){ msg("불러오기 실패: "+e.message); }
+  };
+  const handleDeleteProject=async(id)=>{
+    if(!window.confirm("이 프로젝트를 삭제하시겠습니까?")) return;
+    try{ await deletePublicProject(user.uid,id); setProjectList(prev=>prev.filter(p=>p.id!==id)); msg("✓ 삭제됨"); }
+    catch{ msg("삭제 실패"); }
+  };
+
+  return(
+    <div style={{fontFamily:C.sans,background:C.bg,color:C.text,minHeight:"100vh",fontSize:"13px"}}>
+      {showLoad&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:9000,display:"flex",alignItems:"center",justifyContent:"center",padding:"16px"}}>
+          <div style={{background:"#fff",borderRadius:"12px",boxShadow:"0 20px 60px rgba(0,0,0,0.3)",width:"min(560px,95vw)",maxHeight:"80vh",display:"flex",flexDirection:"column",overflow:"hidden"}}>
+            <div style={{padding:"14px 18px",borderBottom:`1px solid ${C.border}`,display:"flex",alignItems:"center",gap:"10px"}}>
+              <span style={{fontSize:"16px"}}>📂</span>
+              <div style={{flex:1}}><div style={{fontSize:"13px",fontWeight:700}}>저장된 공공건축물 프로젝트</div><div style={{fontSize:"10px",color:C.muted}}>별도 컬렉션에서 불러옵니다</div></div>
+              <button onClick={()=>setShowLoad(false)} style={{width:"28px",height:"28px",borderRadius:"50%",border:`1px solid ${C.border}`,background:"#fff",cursor:"pointer",fontSize:"16px",fontWeight:700,fontFamily:C.sans}}>×</button>
+            </div>
+            <div style={{overflowY:"auto",padding:"12px"}}>
+              {loadingList?<div style={{textAlign:"center",padding:"30px",color:C.muted}}>불러오는 중...</div>:projectList.length===0?<div style={{textAlign:"center",padding:"30px",color:C.muted}}>저장된 프로젝트가 없습니다</div>:projectList.map(p=>(
+                <div key={p.id} style={{display:"flex",alignItems:"center",gap:"10px",padding:"11px 14px",borderRadius:"8px",border:`1px solid ${C.border}`,marginBottom:"8px",background:"#fff"}}>
+                  <div style={{flex:1}}><div style={{fontSize:"13px",fontWeight:600}}>{p.name}</div><div style={{fontSize:"10px",color:C.muted}}>저장: {p.savedAt||"—"}</div></div>
+                  <button onClick={()=>handleLoadProject(p.id)} style={{padding:"5px 14px",borderRadius:"6px",border:`1.5px solid ${C_public}`,background:C.tealBg,color:C_public,fontSize:"11px",fontWeight:600,cursor:"pointer",fontFamily:C.sans}}>불러오기</button>
+                  <button onClick={()=>handleDeleteProject(p.id)} style={{padding:"5px 10px",borderRadius:"6px",border:`1px solid ${C.border}`,background:"#fff",color:C.red,fontSize:"11px",cursor:"pointer",fontFamily:C.sans}}>삭제</button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+      {saveMsg&&<div style={{position:"fixed",bottom:"24px",right:"24px",zIndex:9999,padding:"10px 18px",borderRadius:"9px",background:C_public,color:"#fff",fontSize:"13px",fontWeight:600,boxShadow:"0 4px 20px rgba(0,0,0,0.3)"}}>{saveMsg}</div>}
+
+      <div style={{background:"#064e3b",padding:"11px 18px",display:"flex",alignItems:"center",gap:"13px",position:"sticky",top:0,zIndex:400,boxShadow:"0 2px 8px rgba(0,0,0,0.3)"}}>
+        <div style={{width:"32px",height:"32px",background:C_public,borderRadius:"8px",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"18px"}}>🏛</div>
+        <div style={{flex:1}}>
+          <div style={{fontSize:"13px",fontWeight:700,color:"#ecfdf5"}}>공공건축물 B/C 사업성 계산기 {pub.projectName&&<span style={{fontSize:"11px",color:"#6ee7b7",marginLeft:"8px"}}>— {pub.projectName}</span>}</div>
+          <div style={{fontSize:"9px",color:"#5eead4",letterSpacing:"0.04em"}}>Public Facility Feasibility · 재무수입 + 간편 공공편익</div>
+        </div>
+        {calc.totalCost>0&&<div style={{display:"flex",gap:"14px",flexWrap:"wrap"}}>
+          {[["총사업비",fM(calc.totalCost*1000)],["연 방문객",fM(calc.firstOp.visitors)],["B/C",fP(calc.bc,2)],["NPV",fM(calc.NPV*1000)]].map(([l,v])=>(
+            <div key={l} style={{textAlign:"right"}}><div style={{fontSize:"8px",color:"#99f6e4"}}>{l}</div><div style={{fontSize:"12px",fontFamily:C.mono,color:"#ecfdf5",fontWeight:700}}>{v}</div></div>
+          ))}
+        </div>}
+      </div>
+
+      <div style={{background:"#fff",borderBottom:`1px solid ${C.border}`,padding:"6px 18px",display:"flex",alignItems:"center",gap:"10px",flexWrap:"wrap",justifyContent:"flex-end"}}>
+        <button onClick={()=>onSwitch("general")} style={{padding:"5px 12px",borderRadius:"6px",border:`1.5px solid ${C.accent}`,background:C.accentBg,color:C.accent,fontSize:"11px",fontWeight:700,cursor:"pointer",fontFamily:C.sans}}>🏢 일반건축물로 전환</button>
+        <button onClick={()=>onSwitch("apartment")} style={{padding:"5px 12px",borderRadius:"6px",border:"1.5px solid #7c3aed",background:"#f5f3ff",color:"#7c3aed",fontSize:"11px",fontWeight:700,cursor:"pointer",fontFamily:C.sans}}>🏠 공동주택으로 전환</button>
+        <div style={{width:"1px",height:"18px",background:C.border}}/>
+        <button onClick={handleLoad} style={{padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C.mid,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>📂 불러오기{user?" (클라우드)":""}</button>
+        <button onClick={handleSave} style={{padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C_public}`,background:C.tealBg,color:C_public,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>💾 저장{user?" (클라우드)":""}</button>
+        {lastSaved&&<span style={{fontSize:"9px",color:C.muted}}>저장: {lastSaved}</span>}
+        <div style={{width:"1px",height:"18px",background:C.border}}/>
+        {user?<div style={{display:"flex",alignItems:"center",gap:"6px"}}><span style={{fontSize:"11px",color:C.mid,fontWeight:600}}>{user.name||user.email}</span><button onClick={signOut} style={{fontSize:"10px",padding:"3px 8px",borderRadius:"5px",border:`1px solid ${C.border}`,background:"#fff",color:C.muted,cursor:"pointer",fontFamily:C.sans}}>로그아웃</button></div>:<button onClick={signIn} disabled={authLoading} style={{padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C.mid,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600,opacity:authLoading?0.6:1}}>Google 로그인</button>}
+      </div>
+
+      <div style={{background:"#fff",borderBottom:`1px solid ${C.border}`,padding:"8px 18px",display:"flex",alignItems:"center",gap:"8px",flexWrap:"wrap"}}>
+        <span style={{fontSize:"10px",fontWeight:700,color:C.muted,letterSpacing:"0.04em"}}>시설유형</span>
+        {Object.entries(PUBLIC_TEMPLATES).map(([key,t])=>{
+          const active=pub.templateKey===key;
+          return <button key={key} onClick={()=>D("PUBLIC_TEMPLATE",key)} style={{padding:"6px 12px",borderRadius:"8px",border:`1.5px solid ${active?C_public:C.border}`,background:active?C.tealBg:"#fff",color:active?C_public:C.mid,fontSize:"11px",fontWeight:active?700:500,cursor:"pointer",fontFamily:C.sans}}>{t.icon} {t.label}</button>;
+        })}
+        <div style={{marginLeft:"auto",fontSize:"10px",color:C.muted}}>금액 단위: 천원, 단가: 원 또는 천원/㎡ 입력란 표기 기준</div>
+      </div>
+
+      <div style={{background:"#fff",borderBottom:`1.5px solid ${C.border}`,padding:"0 18px",display:"flex",overflowX:"auto"}}>
+        {PUBLIC_TABS.map(({id,label,icon})=>{
+          const active=pub.activeTab===id;
+          return <button key={id} onClick={()=>D("PUBLIC_TAB",id)} style={{padding:"10px 14px",background:"transparent",border:"none",borderBottom:active?`2.5px solid ${C_public}`:"2.5px solid transparent",color:active?C_public:C.muted,cursor:"pointer",fontSize:"11px",fontWeight:active?700:400,fontFamily:C.sans,marginBottom:"-1.5px",whiteSpace:"nowrap",display:"flex",alignItems:"center",gap:"4px"}}><span>{icon}</span>{label}</button>;
+        })}
+      </div>
+
+      <div style={{maxWidth:"1100px",margin:"0 auto",padding:"14px"}}>
+        {pub.activeTab==="overview"&&<PublicOverviewTab pub={pub} dispatch={dispatch} calc={calc}/>}
+        {pub.activeTab==="cost"&&<PublicCostTab pub={pub} dispatch={dispatch} calc={calc}/>}
+        {pub.activeTab==="benefit"&&<PublicBenefitTab pub={pub} dispatch={dispatch} calc={calc}/>}
+        {pub.activeTab==="analysis"&&<PublicAnalysisTab pub={pub} dispatch={dispatch} calc={calc}/>}
+        {pub.activeTab==="flow"&&<PublicFlowTab calc={calc}/>}
+      </div>
+      <div style={{textAlign:"center",fontSize:"9px",color:C.muted,padding:"12px 0 24px",letterSpacing:"0.04em"}}>
+        공공건축물 B/C 계산기 v1.0 · 간편 검토용이며 예비타당성조사 또는 투자심사 대체자료가 아닙니다
+      </div>
+    </div>
+  );
+}
+
+function PublicOverviewTab({pub,dispatch,calc}){
+  const D=(p)=>dispatch({type:"PUBLIC_AREA",p});
+  return(
+    <div>
+      <Card title="프로젝트 개요" tag="PUBLIC FACILITY" accentBar={C_public}>
+        <G cols="repeat(auto-fit,minmax(160px,1fr))">
+          <TInput label="프로젝트명" value={pub.projectName} onChange={v=>dispatch({type:"PUBLIC_PROJECT",p:v})} mono={false}/>
+          <TInput label="위치" value={pub.area.location} onChange={v=>D({location:v})} mono={false}/>
+          <TInput label="용도지역" value={pub.area.zoneType} onChange={v=>D({zoneType:v})} mono={false}/>
+          <TInput label="대지면적" value={pub.area.siteArea} onChange={v=>D({siteArea:v})} unit="㎡"/>
+          <TInput label="건축면적" value={pub.area.buildingArea} onChange={v=>D({buildingArea:v})} unit="㎡"/>
+          <TInput label="연면적" value={pub.area.gfa} onChange={v=>D({gfa:v})} unit="㎡"/>
+          <TInput label="지상층" value={pub.area.floorsAbove} onChange={v=>D({floorsAbove:v})} unit="층"/>
+          <TInput label="지하층" value={pub.area.floorsBelow} onChange={v=>D({floorsBelow:v})} unit="층"/>
+        </G>
+      </Card>
+      <Card title="면적 지표" tag="AREA SUMMARY">
+        <G cols="repeat(auto-fit,minmax(130px,1fr))">
+          <KpiCard label="연면적" value={fM(calc.gfa)} unit="㎡" large/>
+          <KpiCard label="건폐율" value={fP(calc.bcr)} unit="%"/>
+          <KpiCard label="용적률" value={fP(calc.far)} unit="%"/>
+          <KpiCard label="㎡당 총사업비" value={calc.gfa>0?fM(calc.totalCost*1000/calc.gfa):"—"} unit="원/㎡"/>
+        </G>
+      </Card>
+    </div>
+  );
+}
+
+function PublicCostTab({pub,dispatch,calc}){
+  const D=(p)=>dispatch({type:"PUBLIC_COST",p});
+  return(
+    <div>
+      <Card title="사업비 입력" tag="COST INPUT" accentBar={C.amber}>
+        <G cols="repeat(auto-fit,minmax(150px,1fr))">
+          <TInput label="토지비" value={pub.cost.landCost} onChange={v=>D({landCost:v})} unit="천원"/>
+          <TInput label="공사비 단가" value={pub.cost.constrUnit} onChange={v=>D({constrUnit:v})} unit="천원/㎡"/>
+          <TInput label="간접비율" value={pub.cost.indirectR} onChange={v=>D({indirectR:v})} unit="%"/>
+          <TInput label="예비비율" value={pub.cost.reserveR} onChange={v=>D({reserveR:v})} unit="%"/>
+          <TInput label="금융비율" value={pub.cost.financeR} onChange={v=>D({financeR:v})} unit="%/년"/>
+          <TInput label="공사기간" value={pub.cost.constYears} onChange={v=>D({constYears:v})} unit="년"/>
+        </G>
+      </Card>
+      <Card title="사업비 산출" tag="COST SUMMARY">
+        <G cols="repeat(auto-fit,minmax(130px,1fr))">
+          <KpiCard label="직접공사비" value={fM(calc.direct*1000)} unit=""/>
+          <KpiCard label="간접비" value={fM(calc.indirect*1000)} unit=""/>
+          <KpiCard label="예비비" value={fM(calc.reserve*1000)} unit=""/>
+          <KpiCard label="금융비용" value={fM(calc.finance*1000)} unit=""/>
+          <KpiCard label="총사업비" value={fM(calc.totalCost*1000)} unit="" large hi/>
+        </G>
+      </Card>
+    </div>
+  );
+}
+
+function PublicBenefitTab({pub,dispatch,calc}){
+  const D=(p)=>dispatch({type:"PUBLIC_REV",p});
+  return(
+    <div>
+      <Card title="수입/편익 입력" tag="REVENUE + PUBLIC BENEFIT" accentBar={C_public}>
+        <G cols="repeat(auto-fit,minmax(150px,1fr))">
+          <TInput label="연간 방문객" value={pub.revenue.visitors} onChange={v=>D({visitors:v})} unit="명"/>
+          <TInput label="입장료" value={pub.revenue.ticket} onChange={v=>D({ticket:v})} unit="원/명"/>
+          <TInput label="부대수입 단가" value={pub.revenue.ancillaryPerVisitor} onChange={v=>D({ancillaryPerVisitor:v})} unit="원/명"/>
+          <TInput label="연 임대/대관수입" value={pub.revenue.rentIncome} onChange={v=>D({rentIncome:v})} unit="천원/년"/>
+          <TInput label="이용자 편익 단가" value={pub.revenue.publicBenefitPerVisitor} onChange={v=>D({publicBenefitPerVisitor:v})} unit="원/명"/>
+          <TInput label="방문객 증가율" value={pub.revenue.visitorGrowthR} onChange={v=>D({visitorGrowthR:v})} unit="%/년"/>
+          <TInput label="연 운영비" value={pub.revenue.opCost} onChange={v=>D({opCost:v})} unit="천원/년"/>
+          <TInput label="운영비 증가율" value={pub.revenue.opCostGrowthR} onChange={v=>D({opCostGrowthR:v})} unit="%/년"/>
+        </G>
+      </Card>
+      <Card title="운영 첫해 편익" tag="YEAR 1 BENEFIT">
+        <G cols="repeat(auto-fit,minmax(130px,1fr))">
+          <KpiCard label="재무수입" value={fM((calc.firstOp.financial||0)*1000)} unit=""/>
+          <KpiCard label="공공편익" value={fM((calc.firstOp.publicBenefit||0)*1000)} unit=""/>
+          <KpiCard label="운영비" value={fM((calc.firstOp.opCost||0)*1000)} unit=""/>
+          <KpiCard label="순편익" value={fM((calc.firstOp.net||0)*1000)} unit="" ok2={(calc.firstOp.net||0)>0} warn={(calc.firstOp.net||0)<0}/>
+        </G>
+      </Card>
+    </div>
+  );
+}
+
+function PublicAnalysisTab({pub,dispatch,calc}){
+  const D=(p)=>dispatch({type:"PUBLIC_ANLYS",p});
+  return(
+    <div>
+      <Card title="분석 파라미터" tag="PARAMETERS">
+        <G cols="repeat(auto-fit,minmax(150px,1fr))">
+          <TInput label="할인율" value={pub.anlys.discountR} onChange={v=>D({discountR:v})} unit="%"/>
+          <TInput label="분석기간" value={pub.anlys.analysisYears} onChange={v=>D({analysisYears:v})} unit="년"/>
+          <TInput label="잔존가치율" value={pub.anlys.residualR} onChange={v=>D({residualR:v})} unit="%"/>
+        </G>
+      </Card>
+      <Card title="B/C 분석 결과" tag="BENEFIT-COST" accentBar={calc.bc>=1?C.green:C.red}>
+        <G cols="repeat(auto-fit,minmax(140px,1fr))">
+          <div style={{background:calc.bc>=1?C.greenBg:C.redBg,border:`1.5px solid ${calc.bc>=1?C.green:C.red}30`,borderRadius:"9px",padding:"11px 13px"}}>
+            <div style={{fontSize:"10px",color:C.muted,fontWeight:600,marginBottom:"4px"}}>B/C</div>
+            <div style={{fontFamily:C.mono,fontSize:"23px",color:calc.bc>=1?C.green:C.red,fontWeight:700}}>{fP(calc.bc,2)}</div>
+            <div style={{fontSize:"9px",color:calc.bc>=1.2?C.green:calc.bc>=1?C.amber:C.red,marginTop:"4px"}}>{calc.bc>=1.2?"✓ 우수":calc.bc>=1?"△ 검토 가능":"✗ 미달"}</div>
+          </div>
+          <KpiCard label="PV 편익" value={fM(calc.pvBenefit*1000)} unit="" hi/>
+          <KpiCard label="PV 비용" value={fM(calc.pvCost*1000)} unit=""/>
+          <KpiCard label="NPV" value={fM(calc.NPV*1000)} unit="" ok2={calc.NPV>0} warn={calc.NPV<0}/>
+          <KpiCard label="IRR" value={calc.IRR!==null?fP(calc.IRR):"—"} unit="%" ok2={calc.IRR!==null&&calc.IRR>=n(pub.anlys.discountR)} warn={calc.IRR!==null&&calc.IRR<n(pub.anlys.discountR)}/>
+          <KpiCard label="회수시점" value={calc.payback!==null?calc.payback:"—"} unit={calc.payback!==null?"년차":""}/>
+        </G>
+      </Card>
+    </div>
+  );
+}
+
+function PublicFlowTab({calc}){
+  const th={padding:"7px 9px",fontSize:"10px",color:C.muted,fontWeight:700,borderRight:`1px solid ${C.border}`,whiteSpace:"nowrap",background:C.cardAlt};
+  return(
+    <Card title="연도별 현금흐름" tag="CASH FLOW">
+      <div style={{overflowX:"auto",border:`1.5px solid ${C.border}`,borderRadius:"8px"}}>
+        <table style={{width:"100%",borderCollapse:"collapse",minWidth:"760px"}}>
+          <thead><tr>{["연도","구분","방문객","편익","비용","순편익","현재가치","누적"].map((h,i)=><th key={h} style={{...th,textAlign:i<2?"left":"right"}}>{h}</th>)}</tr></thead>
+          <tbody>
+            {calc.cfs.map(cf=>(
+              <tr key={cf.y} style={{borderBottom:`1px solid ${C.faint}`,background:cf.y%2?C.cardAlt:"#fff"}}>
+                <td style={{padding:"6px 9px",fontSize:"10px",color:C.muted,borderRight:`1px solid ${C.border}`}}>{cf.y}년차</td>
+                <td style={{padding:"6px 9px",fontSize:"10px",color:C.mid,borderRight:`1px solid ${C.border}`}}>{cf.label}</td>
+                {[cf.visitors,cf.benefit*1000,cf.cost*1000,cf.net*1000,cf.pv*1000,cf.cum*1000].map((v,i)=>(
+                  <td key={i} style={{padding:"6px 9px",textAlign:"right",fontFamily:C.mono,fontSize:"10px",color:i>=2&&v<0?C.red:i>=2&&v>0?C.green:C.mid,borderRight:i<5?`1px solid ${C.border}`:"none"}}>
+                    {i===0?fM(v):v<0?`(${fM(Math.abs(v))})`:fM(v)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Card>
+  );
+}
+
 
 const TABS=[
   {id:"area",    label:"면적표",   icon:"📐"},
@@ -4199,7 +4638,7 @@ const TABS=[
 ];
 
 export default function App(){
-  const[mode,setMode]=useState("general"); // "general" | "apartment"
+  const[mode,setMode]=useState("general"); // "general" | "apartment" | "public"
   const[state,dispatch]=useReducer(reducer,null,getInitState);
   const{siteMode,site,buildings,activeBldgId,activeTab,refs}=state;
   const D=useCallback((type,p)=>dispatch({type,p}),[]);
@@ -4316,6 +4755,11 @@ export default function App(){
         signIn={signIn} signOut={signOut}
         onSave={handleSave} onLoad={handleLoad} lastSaved={lastSaved}/>
     </AptErrorBoundary>
+  );
+
+  if(mode==="public") return(
+    <PublicMode onSwitch={setMode} user={user} authLoading={authLoading}
+      signIn={signIn} signOut={signOut}/>
   );
 
   return(
@@ -4480,4 +4924,3 @@ export default function App(){
     </div>
   );
 }
-
