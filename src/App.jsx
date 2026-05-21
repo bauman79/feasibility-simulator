@@ -127,6 +127,60 @@ async function deletePublicProject(uid, projectId){
   await deleteDoc(doc(db,"users",uid,"public_projects",projectId));
 }
 
+const FS_FILE_TYPE="feasibility-simulator/fs";
+const FS_SCHEMA_VERSION=1;
+const MODE_LABELS={general:"일반건축물",apartment:"공동주택",public:"공공건축물"};
+
+function sanitizeFileName(name){
+  return String(name||"프로젝트").replace(/[\\/:*?"<>|]/g," ").replace(/\s+/g," ").trim().slice(0,60)||"프로젝트";
+}
+function getFsDate(){
+  const d=new Date();
+  const yy=d.getFullYear();
+  const mm=String(d.getMonth()+1).padStart(2,"0");
+  const dd=String(d.getDate()).padStart(2,"0");
+  return `${yy}${mm}${dd}`;
+}
+function getFsFileName(mode,projectName){
+  return `${sanitizeFileName(projectName)}-${MODE_LABELS[mode]||mode}-${getFsDate()}.fs`;
+}
+function createFsFile(mode,projectName,payload){
+  return{
+    fileType:FS_FILE_TYPE,
+    schemaVersion:FS_SCHEMA_VERSION,
+    mode,
+    modeLabel:MODE_LABELS[mode]||mode,
+    appVersion:"v1",
+    savedAt:new Date().toISOString(),
+    projectName:projectName||MODE_LABELS[mode]||"프로젝트",
+    payload,
+  };
+}
+function downloadFsFile(fsDoc){
+  const blob=new Blob([JSON.stringify(fsDoc,null,2)],{type:"application/json"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+  a.href=url;
+  a.download=getFsFileName(fsDoc.mode,fsDoc.projectName);
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+async function readFsFile(file){
+  const text=await file.text();
+  return JSON.parse(text);
+}
+function validateFsFile(fsDoc){
+  if(!fsDoc||fsDoc.fileType!==FS_FILE_TYPE) throw new Error("지원하지 않는 fs 파일입니다");
+  if(fsDoc.schemaVersion!==FS_SCHEMA_VERSION) throw new Error("지원하지 않는 fs 파일 버전입니다");
+  if(!["general","apartment","public"].includes(fsDoc.mode)||!fsDoc.payload) throw new Error("파일 구조가 올바르지 않습니다");
+  if(fsDoc.mode==="general"&&(!fsDoc.payload.buildings||!fsDoc.payload.site)) throw new Error("일반건축물 파일 구조가 올바르지 않습니다");
+  if(fsDoc.mode==="apartment"&&(!fsDoc.payload.types||!fsDoc.payload.siteInfo)) throw new Error("공동주택 파일 구조가 올바르지 않습니다");
+  if(fsDoc.mode==="public"&&(!fsDoc.payload.area||!fsDoc.payload.cost||!fsDoc.payload.revenue)) throw new Error("공공건축물 파일 구조가 올바르지 않습니다");
+  return fsDoc;
+}
+
 // ═══════════════════════════════════════════════════════
 // § 1. 법정 기준 데이터
 // ═══════════════════════════════════════════════════════
@@ -671,7 +725,7 @@ const C={
 // ═══════════════════════════════════════════════════════
 // § 7-A. 인증·저장 UI
 // ═══════════════════════════════════════════════════════
-function AuthBar({user,loading,signIn,signOut,onSave,onLoad,lastSaved,onModeSwitch,saveMsg}){
+function AuthBar({user,loading,signIn,signOut,onSave,onLoad,onFsSave,onFsLoad,lastSaved,onModeSwitch,saveMsg}){
   return(
     <div style={{background:"#fff",borderBottom:`1px solid ${C.border}`,padding:"6px 18px",display:"flex",alignItems:"center",gap:"10px",flexWrap:"wrap",justifyContent:"flex-end"}}>
       <button onClick={()=>onModeSwitch&&onModeSwitch("apartment")} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:"1.5px solid #7c3aed",background:"#f5f3ff",color:"#7c3aed",fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:700}}>
@@ -686,6 +740,12 @@ function AuthBar({user,loading,signIn,signOut,onSave,onLoad,lastSaved,onModeSwit
       </button>
       <button onClick={onSave} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.accent}`,background:C.accentBg,color:C.accent,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>
         💾 저장{user?" (클라우드)":""}
+      </button>
+      <button onClick={onFsSave} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.teal}`,background:C.tealBg,color:C.teal,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>
+        ⬇ 내컴저장
+      </button>
+      <button onClick={onFsLoad} style={{display:"flex",alignItems:"center",gap:"5px",padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C.teal,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>
+        ⬆ 내컴불러오기
       </button>
       {lastSaved&&<span style={{fontSize:"9px",color:C.muted}}>저장: {lastSaved}</span>}
       {saveMsg&&<span style={{fontSize:"10px",color:C.green,fontWeight:600}}>{saveMsg}</span>}
@@ -3932,7 +3992,7 @@ const getAptTabs=(mode)=>[
   {id:"criteria", label:"검토기준",  icon:"📋"},
 ];
 
-function AptMode({onSwitch,user,authLoading,signIn,signOut,onSave,onLoad,lastSaved}){
+function AptMode({onSwitch,user,authLoading,signIn,signOut,onSave,onLoad,lastSaved,fsImport,onFsSave,onFsLoad}){
   const[apt,aptDispatch]=useReducer(aptReducer,null,()=>{
     // 시작 시 로컬에서 apt 상태 복원 시도
     try{
@@ -3950,6 +4010,13 @@ function AptMode({onSwitch,user,authLoading,signIn,signOut,onSave,onLoad,lastSav
   const[aptLoadingList,setAptLoadingList]=useState(false);
 
   const showAptMsg=(msg)=>{ setAptSaveMsg(msg); setTimeout(()=>setAptSaveMsg(null),3000); };
+
+  useEffect(()=>{
+    if(fsImport?.mode!=="apartment"||!fsImport.payload) return;
+    aptDispatch({type:"LOAD_STATE",p:fsImport.payload});
+    try{ localStorage.setItem("apt_v8_state",JSON.stringify(fsImport.payload)); }catch{}
+    showAptMsg("✓ 내컴 파일에서 불러옴");
+  },[fsImport]);
 
   // apt 전용 클라우드 저장
   const handleAptSave=async()=>{
@@ -4102,6 +4169,8 @@ function AptMode({onSwitch,user,authLoading,signIn,signOut,onSave,onLoad,lastSav
         <div style={{width:"1px",height:"18px",background:C.border}}/>
         <button onClick={handleAptLoad} style={{padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C.mid,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>📂 불러오기{user?" (클라우드)":""}</button>
         <button onClick={handleAptSave} style={{padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.accent}`,background:C.accentBg,color:C.accent,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>💾 저장{user?" (클라우드)":""}</button>
+        <button onClick={()=>{ if(onFsSave&&onFsSave("apartment",apt.projectName||"공동주택",apt)) showAptMsg("✓ 내컴저장 파일 생성됨"); }} style={{padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.teal}`,background:C.tealBg,color:C.teal,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>⬇ 내컴저장</button>
+        <button onClick={onFsLoad} style={{padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C.teal,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>⬆ 내컴불러오기</button>
         {aptLastSaved&&<span style={{fontSize:"9px",color:C.muted}}>저장: {aptLastSaved}</span>}
         {aptSaveMsg&&<span style={{fontSize:"10px",color:C.green,fontWeight:600}}>{aptSaveMsg}</span>}
         <div style={{width:"1px",height:"18px",background:C.border}}/>
@@ -4354,7 +4423,7 @@ const PUBLIC_TABS=[
   {id:"flow",label:"산출내역",icon:"🔁"},
 ];
 
-function PublicMode({onSwitch,user,authLoading,signIn,signOut}){
+function PublicMode({onSwitch,user,authLoading,signIn,signOut,fsImport,onFsSave,onFsLoad}){
   const[pub,dispatch]=useReducer(publicReducer,null,getPublicInitState);
   const[saveMsg,setSaveMsg]=useState(null);
   const[lastSaved,setLastSaved]=useState(null);
@@ -4364,6 +4433,13 @@ function PublicMode({onSwitch,user,authLoading,signIn,signOut}){
   const calc=useMemo(()=>calcPublicFacility(pub),[pub]);
   const D=(type,p)=>dispatch({type,p});
   const msg=m=>{ setSaveMsg(m); setTimeout(()=>setSaveMsg(null),3000); };
+
+  useEffect(()=>{
+    if(fsImport?.mode!=="public"||!fsImport.payload) return;
+    dispatch({type:"PUBLIC_LOAD",p:fsImport.payload});
+    try{ localStorage.setItem(PUBLIC_LOCAL_KEY,JSON.stringify(fsImport.payload)); }catch{}
+    msg("✓ 내컴 파일에서 불러옴");
+  },[fsImport]);
 
   const handleSave=async()=>{
     if(user){
@@ -4454,6 +4530,8 @@ function PublicMode({onSwitch,user,authLoading,signIn,signOut}){
         <div style={{width:"1px",height:"18px",background:C.border}}/>
         <button onClick={handleLoad} style={{padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C.mid,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>📂 불러오기{user?" (클라우드)":""}</button>
         <button onClick={handleSave} style={{padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C_public}`,background:C.tealBg,color:C_public,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>💾 저장{user?" (클라우드)":""}</button>
+        <button onClick={()=>{ if(onFsSave&&onFsSave("public",pub.projectName||"공공건축물",pub)) msg("✓ 내컴저장 파일 생성됨"); }} style={{padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C_public}`,background:C.tealBg,color:C_public,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>⬇ 내컴저장</button>
+        <button onClick={onFsLoad} style={{padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C_public,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600}}>⬆ 내컴불러오기</button>
         {lastSaved&&<span style={{fontSize:"9px",color:C.muted}}>저장: {lastSaved}</span>}
         <div style={{width:"1px",height:"18px",background:C.border}}/>
         {user?<div style={{display:"flex",alignItems:"center",gap:"6px"}}><span style={{fontSize:"11px",color:C.mid,fontWeight:600}}>{user.name||user.email}</span><button onClick={signOut} style={{fontSize:"10px",padding:"3px 8px",borderRadius:"5px",border:`1px solid ${C.border}`,background:"#fff",color:C.muted,cursor:"pointer",fontFamily:C.sans}}>로그아웃</button></div>:<button onClick={signIn} disabled={authLoading} style={{padding:"4px 11px",borderRadius:"6px",border:`1.5px solid ${C.border}`,background:"#fff",color:C.mid,fontSize:"11px",fontFamily:C.sans,cursor:"pointer",fontWeight:600,opacity:authLoading?0.6:1}}>Google 로그인</button>}
@@ -4652,10 +4730,55 @@ export default function App(){
   const[showLoadModal,setShowLoadModal]=useState(false);
   const[projectList,setProjectList]=useState([]);
   const[loadingProjects,setLoadingProjects]=useState(false);
+  const fsInputRef=useRef(null);
+  const[pendingFsImport,setPendingFsImport]=useState(null);
 
   const showMsg=(msg,isErr=false)=>{
     setSaveMsg(msg);
     setTimeout(()=>setSaveMsg(null),3000);
+  };
+
+  const handleFsSave=(targetMode,projectName,payload)=>{
+    try{
+      downloadFsFile(createFsFile(targetMode,projectName,payload));
+      showMsg("✓ 내컴저장 파일 생성됨");
+      return true;
+    }catch(e){
+      showMsg("내컴저장 실패: "+e.message);
+      return false;
+    }
+  };
+
+  const handleFsLoadClick=()=>{
+    if(!fsInputRef.current) return;
+    fsInputRef.current.value="";
+    fsInputRef.current.click();
+  };
+
+  const handleFsFileChange=async(e)=>{
+    const file=e.target.files?.[0];
+    if(!file) return;
+    try{
+      const fsDoc=validateFsFile(await readFsFile(file));
+      if(fsDoc.mode==="general"){
+        dispatch({type:"LOAD_STATE",p:fsDoc.payload});
+        saveLocal(fsDoc.payload);
+        setMode("general");
+        showMsg("✓ 일반건축물 파일을 불러옴");
+      }else if(fsDoc.mode==="apartment"){
+        localStorage.setItem("apt_v8_state",JSON.stringify(fsDoc.payload));
+        setPendingFsImport({mode:"apartment",payload:fsDoc.payload,nonce:Date.now()});
+        setMode("apartment");
+        showMsg("✓ 공동주택 파일을 불러옴");
+      }else if(fsDoc.mode==="public"){
+        localStorage.setItem(PUBLIC_LOCAL_KEY,JSON.stringify(fsDoc.payload));
+        setPendingFsImport({mode:"public",payload:fsDoc.payload,nonce:Date.now()});
+        setMode("public");
+        showMsg("✓ 공공건축물 파일을 불러옴");
+      }
+    }catch(err){
+      showMsg(err.message||"파일을 읽을 수 없습니다");
+    }
   };
 
   const handleSave=async()=>{
@@ -4750,20 +4873,29 @@ export default function App(){
 
   // 공동주택 모드
   if(mode==="apartment") return(
-    <AptErrorBoundary onSwitch={setMode}>
-      <AptMode onSwitch={setMode} user={user} authLoading={authLoading}
-        signIn={signIn} signOut={signOut}
-        onSave={handleSave} onLoad={handleLoad} lastSaved={lastSaved}/>
-    </AptErrorBoundary>
+    <>
+      <input ref={fsInputRef} type="file" accept=".fs,application/json" onChange={handleFsFileChange} style={{display:"none"}}/>
+      <AptErrorBoundary onSwitch={setMode}>
+        <AptMode onSwitch={setMode} user={user} authLoading={authLoading}
+          signIn={signIn} signOut={signOut}
+          onSave={handleSave} onLoad={handleLoad} lastSaved={lastSaved}
+          fsImport={pendingFsImport} onFsSave={handleFsSave} onFsLoad={handleFsLoadClick}/>
+      </AptErrorBoundary>
+    </>
   );
 
   if(mode==="public") return(
-    <PublicMode onSwitch={setMode} user={user} authLoading={authLoading}
-      signIn={signIn} signOut={signOut}/>
+    <>
+      <input ref={fsInputRef} type="file" accept=".fs,application/json" onChange={handleFsFileChange} style={{display:"none"}}/>
+      <PublicMode onSwitch={setMode} user={user} authLoading={authLoading}
+        signIn={signIn} signOut={signOut}
+        fsImport={pendingFsImport} onFsSave={handleFsSave} onFsLoad={handleFsLoadClick}/>
+    </>
   );
 
   return(
     <div style={{fontFamily:C.sans,background:C.bg,color:C.text,minHeight:"100vh",fontSize:"13px"}}>
+      <input ref={fsInputRef} type="file" accept=".fs,application/json" onChange={handleFsFileChange} style={{display:"none"}}/>
       {/* 토지이음 모달 */}
       {showEum&&<EumModal onClose={()=>setShowEum(false)}/>}
 
@@ -4837,7 +4969,8 @@ export default function App(){
       {/* 인증 + 저장 바 */}
       <AuthBar user={user} loading={authLoading} signIn={signIn} signOut={signOut}
         onSave={handleSave} onLoad={handleLoad} lastSaved={lastSaved}
-        onModeSwitch={setMode} saveMsg={saveMsg}/>
+        onFsSave={()=>handleFsSave("general",state.buildings?.[0]?.name||"일반건축물",state)}
+        onFsLoad={handleFsLoadClick} onModeSwitch={setMode} saveMsg={saveMsg}/>
 
       {/* 대지 모드 */}
       <div style={{background:"#fff",borderBottom:`1px solid ${C.border}`,padding:"7px 18px",display:"flex",alignItems:"center",gap:"14px",flexWrap:"wrap"}}>
